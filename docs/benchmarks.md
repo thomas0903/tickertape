@@ -25,6 +25,9 @@ Seeks with and without the seek index, at both payloads and with both readers, o
 [under 2026-11-26](#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms).
 The investigation of the two aarch64 observations that 1.0.0 left open (the zero-copy reader's 10 ms maximum, the
 lagging view of issue #43) is [under 2026-11-26](#2026-11-26-the-two-aarch64-observations-left-open-by-100-google-cloud-vms).
+How much of the throughput ceiling and of the latency tail is the storage device (fio on the same SSDs, the journal on
+tmpfs, one storage setting at a time, a payload sweep, the two local SSDs striped) is
+[under 2026-11-26](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms).
 Why replay speed changed with the layout of `Reader`, and the before and after of its fixed layout (ADR 0057), are
 [under 2026-11-26](#2026-11-26-the-layout-of-reader-adr-0057-issue-86-google-cloud-vms).
 What the Linux prefault window adds to a checkpoint (bytes, sync time, append and reader latency) is
@@ -3370,7 +3373,9 @@ runs showed the same stalls (below). Waits of the writer's thread of 3 ms or mor
   is: commits logged for 4 ms (p50), 129 ms (p90), at most 304 ms on aarch64, and at most 1 ms on x86-64 at the same
   share of its probe, where the same workload has no such stall; on aarch64 81 of the traced log writes took 20 ms or
   more, on x86-64 none reached 1 ms. **Why that device queues at 92 % of its probe, on this shape only, is not
-  explained**; nothing traced inside the guest accounts for it.
+  explained**; nothing traced inside the guest accounts for it. (Measured since: both shapes' local SSDs are capped at
+  351 MB/s, and with its defaults tickertape made the aarch64 device write 7 % more than it appended; 2026-11-26, "how
+  much of the limit is the disk", below.)
 - **Test of that: `lazytime`.** With the filesystem remounted `lazytime`, which keeps modification times out of the
   journal, the same workload has 3–10 seconds with a 50 ms append per run instead of 28–30 (three 60-second runs each,
   interleaved, one VM shape), and every one of them is a roll. The roll appends get longer (max 114–130 ms, against
@@ -4085,6 +4090,377 @@ implementation.
 Not measured: xfs; other machine sizes; runs long enough to compare rates between writers or readers; tracing overhead
 on these runs (the untraced runs had events at a similar rate: 1 in 227 s and 1 in 600 s); the independent pair with the
 trace. The migration probe was attached in the last two aarch64 runs only.
+
+## 2026-11-26, how much of the limit is the disk: fio, tmpfs and one change at a time (Google Cloud VMs)
+
+The owner's question after the stall findings above: "we are kind of limited by disk speed, right? How can we test
+further?" (issue #60). This section measures the storage device by itself with `fio`, runs the sustained scenarios
+with the journal on `tmpfs` (no disk at all) and on the local SSD, changes one storage setting at a time on the SSD, and
+sweeps the payload size unpaced. All of it ran on **Google Cloud virtual machines, not bare metal**, one VM per
+architecture, one after the other, on one day. The raw output (fio JSON and bandwidth logs, `tt-sustained` results and
+series, traces, the scripts) is kept outside the repository.
+
+### Environment and commands
+
+| Machine (us-east1-b) | CPU, vCPUs, memory | Time (UTC) |
+|---|---|---|
+| `c4a-standard-8-lssd` | Google Axion (Neoverse-V2), 8, 31 GiB | 09:29–11:15 |
+| `c4-standard-16-lssd` | Xeon 6985P-C, 16 (8 cores), 59 GiB | 11:18–12:43 |
+| `c4a-standard-8-lssd` (a second VM) | Axion, 8, 31 GiB | 12:44–13:00: device bytes, fio with range syncs |
+
+Ubuntu 24.04, kernel 7.0.0-1017-gcp, rustc 1.100.0, fio 3.36, bpftrace 0.20.2. `main` at `42b2307e` on both
+(`tt-sustained` built on each VM). Each VM has two local NVMe SSDs of 375 GB (`nvme_card0`, `nvme_card1`): the first
+with ext4 (`mkfs.ext4 -E lazy_itable_init=0,lazy_journal_init=0`, mounted `rw,noatime`), the second with xfs (defaults,
+`rw,noatime,inode64,logbufs=8,logbsize=32k`) after the raw-device jobs below had run on it. The local SSDs report
+`write_cache` "write through" (the kernel sends them no cache flushes), I/O scheduler `none`, `max_sectors_kb` 128,
+`nr_requests` 1023, `wbt_lat_usec` 2000. Write-back sysctls at their defaults (`dirty_background_ratio` 10,
+`dirty_ratio` 20, `dirty_expire_centisecs` 3000, `dirty_writeback_centisecs` 500) except in the rows that change them.
+`tmpfs` was a dedicated mount (`mount -t tmpfs -o size=16g tmpfs /mnt/tmpfs`, default `huge=never`). Results on the
+boot disk. Before every run: the journal deleted, `sync`, `fstrim` of the SSD's file system (close to 1 TB was written
+to each device during the session), 3 s pause.
+
+**tickertape** (`tt-sustained`; 60 s measured after 10 s of warm-up, as in the roll section above):
+
+```sh
+tt-sustained run --dir <journal> --out … --json --payload <64|256|1024|4096> --duration 60s --warmup 10s \
+  --cpus 1,2,3,4,5,6 --checkpoint-every 1s --checkpoint-mode background --retain-bytes 4294967296 \
+  --readers mapped,safe:wait=default,safe:durable:wait=block (--unpaced | --rate <rate>) [--no-disk-check on tmpfs]
+```
+
+The rates are the published steady-50 and steady-90 rates of these machine types (second sustained session above):
+x86-64 173,119 / 311,614 records/s at 1,024 B and 1,603,530 / 2,886,355 at 64 B; aarch64 169,206 / 304,571 and
+1,672,614 / 3,010,706. A record of payload P takes P + 40 bytes rounded up to 8 in the journal (1,064 B at 1,024 B, 104
+B at 64 B); "MB/s" below is records/s × that size, the bytes the journal writes. Retention is 4 GiB (not the sessions'
+64 GiB) so that the tmpfs runs never fill memory; on the SSD it deletes segments only after the data is written back.
+"Unpaced" is the probe's command for 60 s instead of 10 minutes. Changes from the default: `--no-early-writeback`,
+`--spare-segment`; without checkpoints the run has no retention and no durable-only reader
+(`--readers mapped,safe:wait=default`); `lazytime` by `mount -o remount,noatime,lazytime`; the dirty limits by
+`sysctl vm.dirty_background_bytes=… vm.dirty_bytes=…` (small: 64 MiB / 256 MiB on both; large: 8 / 16 GiB on aarch64,
+16 / 32 GiB on x86-64), with `dirty_background_ratio=10 dirty_ratio=20` restored after each run. "Writer off-CPU" is
+the run's length minus the CPU time of the writer's measuring thread: time it waited (throttling, journal, I/O).
+"Seconds ≥ 10 ms" counts the measured seconds whose longest append took 10 ms or more.
+
+**fio, the file system** (`journal.fio`, one job file, parameters from the environment):
+
+```ini
+; Sequential buffered writes into one preallocated file, the way a journal segment is written.
+[global]
+directory=${DIR}
+filename=${NAME}
+ioengine=${ENGINE}          ; mmap: stores into a shared mapping; sync: write(2)
+rw=write
+bs=${BS}                    ; 4k or 128k
+size=${SIZE}                ; 64g unthrottled, 24g rate-limited
+fallocate=native
+rate=${RATE}                ; bytes/s: 0, or the 1,024 B steady-50 / steady-90 rate x 1,064
+fdatasync=${SYNC}           ; writes between two syncs (msync(MS_SYNC) for the mmap engine): 1 s of the rate, or 256 MiB unthrottled
+time_based=1
+runtime=45
+unlink=1
+percentile_list=50:99:99.9:99.99
+write_bw_log=${LOG}
+log_avg_msec=1000
+[journal]
+```
+
+The file was made with `fallocate -l <size>` before each job, so fio writes into unwritten extents as the journal does
+(without it fio's mmap engine first writes the whole file; two jobs that did were discarded and rerun). fio syncs on the
+thread that writes, so it never writes while a sync runs; to compare with tickertape, whose checkpoint thread syncs
+beside the writer, three more jobs ran the mmap engine without its own syncs while a separate process called
+`sync -d <file>` (`fdatasync`) once a second (`ext4x-…` below). One more job: 4 KiB buffered writes with an `fdatasync`
+after each (`ENGINE=sync BS=4k SYNC=1`, 20 s), the latency of an ext4 commit on this device.
+
+**fio, the raw device** (`raw.fio`, on the second SSD before its xfs was made): `filename=/dev/disk/by-id/google-local-nvme-ssd-1`,
+`direct=1`, `ioengine=libaio`, `rw=write`, 30 s, with `bs`/`iodepth` 128k/1, 128k/32, 1m/32, 4k/1, and 4k/1 with an
+`fdatasync` after every write.
+
+### The answer in short
+
+- **Throughput: yes, the disk is the limit on these VMs.** Each local SSD writes at most **351 MB/s**, a flat cap
+  that does not move with block size or queue depth (every second of every raw job between 351 and 354 MB/s, on both
+  machine types). Unpaced, tickertape on the SSD gets the device's 351 MB/s plus whatever the page cache takes in before
+  write-back throttling starts (428–434 MB/s over 70 s on aarch64 with 5.1–5.4 GiB left dirty, 506–507 MB/s on x86-64
+  with about 10 GiB); its writer thread spends 54 (aarch64) and 44–45 (x86-64) of the 70 seconds off the CPU, waiting.
+  With the journal on tmpfs the same command writes 1,795–1,808 MB/s (aarch64) and 1,407–1,764 MB/s (x86-64) at 1,024
+  B, three to four times as much. With the two local SSDs striped (RAID 0, 703 MB/s raw) the x86-64 writer reached 850–851 MB/s:
+  it follows the device.
+- **Payload.** From 256 B up the SSD rate is the same in MB/s (430–434 and 506–507) while tmpfs keeps growing (853
+  MB/s at 256 B to 1,972–2,299 at 4,096 B): the device is the limit. At 64 B the two limits nearly meet: on tmpfs the
+  writer does 3.8–4.0 million records/s (394–420 MB/s), on the SSD 3.34–3.37 million (348–351 MB/s) while staying on
+  the CPU (off-CPU 0.1 s on x86-64, 4–6 s on aarch64) and the page cache stays small, with checkpoints durable 0.44–0.61
+  s after the request: CPU-bound, with the device nearly saturated.
+- **Latency: most of the tail at steady-90 on aarch64 is the storage stack, and on that VM most of it went away with
+  early write-back off.** Without a disk (tmpfs with the spare segment, so that rolls do not zero 128 MiB on the writer's
+  thread) the writer's append at steady-90 has p99.9 2.4–2.7 µs, p99.99 4.3–7.0 µs and a maximum of 48 µs (aarch64) and
+  100 µs (x86-64), one run each. On the SSD, x86-64 has p99.99 9.3–11.2 µs and a maximum of 0.25–0.64 ms; aarch64 has
+  p99.99 27–29 µs and maxima of 83–144 ms, with 19–36 seconds per minute containing an append of 10 ms or more (first
+  VM). On aarch64, turning early write-back off brought p99.99 down to 4.1–4.4 µs (tmpfs's level) and the maximum to
+  1.0–2.3 ms in 5 of 5 runs on two VMs, at the price of checkpoints becoming durable 0.93 s after the request instead
+  of 0.05–0.39 s. On x86-64 it changed nothing in the tail and made checkpoints 0.93 s late instead of 2 ms.
+- **The yardstick.** `fio` writing at steady-90's byte rate with a sync every second, and also with tickertape's
+  write-back pattern, did not stall the way tickertape's default did on aarch64 (its writes took at most 0.07–1.7 ms,
+  except one write of 122 ms in a `write` job without range syncs).
+  On a second aarch64 VM tickertape with its defaults made the device write **7 % more bytes** than it appended (24.4
+  GB against 22.7 GB per run; with early write-back off exactly the appended bytes; fio with the same pattern wrote only
+  its data). At steady-90 that is about 348 MB/s for a device that takes 351. What writes the extra bytes was not
+  traced; it is the first thing to look at (below).
+
+### The device by itself (fio)
+
+Selected jobs; MB/s is fio's mean over the job, latencies in µs unless stated, sync latency over all syncs of the job.
+
+| Job | aarch64: MB/s | write p99.9 / max | syncs: n, p50, max | x86-64: MB/s | write p99.9 / max | syncs: n, p50, max |
+|---|---|---|---|---|---|---|
+| raw device, 128 KiB, QD 1 | 351 | 506 / 574 | – | 351 | 586 / 718 | – |
+| raw device, 128 KiB, QD 32 | 351 | 13 ms / 23 ms | – | 351 | 19 ms / 24 ms | – |
+| raw device, 1 MiB, QD 32 | 351 | 154 ms / 185 ms | – | 351 | 156 ms / 185 ms | – |
+| raw device, 4 KiB, QD 1 | 235 | 24.4 / 122 | – | 128 | 255 / 462 | – |
+| raw device, 4 KiB, QD 1, `fdatasync` after each | 233 | 26.2 / 112 | 1,703,331, 16.3, 113 | 125 | 272 / 513 | 918,935, 29.8, 518 |
+| ext4, 4 KiB write + `fdatasync` after each | 53 | 8.5 / 101 | 257,887, 73.2, 10 ms | 27 | 16.3 / 175 | 132,638, 140, 1.2 ms |
+| ext4 mmap 4 KiB, unthrottled, sync every 256 MiB | 334 | 27.0 / 72 | 56, 759 ms, 768 ms | 328 | 54.5 / 154 | 55, 759 ms, 765 ms |
+| ext4 write 128 KiB, unthrottled, sync every 256 MiB | 342 | 29.8 / 96 | 58, 759 ms, 765 ms | 334 | 46.8 / 79 | 56, 759 ms, 765 ms |
+| ext4 mmap 4 KiB at steady-50's rate, sync every 1 s | 178 | 27.8 / 68 | 45, 510 ms, 510 ms | 182 | 52.5 / 119 | 45, 518 ms, 520 ms |
+| ext4 mmap 4 KiB at steady-90's rate, sync every 1 s | 318 | 27.3 / 68 | 45, 919 ms, 920 ms | 320 | 54.0 / 91 | 44, 935 ms, 942 ms |
+| ext4 write 128 KiB at steady-90's rate, sync every 1 s | 318 | 27.0 / 100 | 45, 919 ms, 919 ms | 325 | 45.8 / 70 | 45, 935 ms, 941 ms |
+| ext4 mmap 4 KiB at steady-90's rate, `fdatasync` every 1 s from another process | 324 | 30.1 / 1.7 ms | 5, 4.0 s, 5.2 s | 332 | 105 / 792 | 6, 4.9 s, 10.9 s |
+| ext4 mmap 4 KiB at steady-50's rate, the same | 180 | 29.3 / 927 | 13, 1.08 s, 1.42 s | 184 | 102 / 1.2 ms | 20, 1.13 s, 1.92 s |
+| ext4 mmap 4 KiB unthrottled, the same | 528 | 31.6 / 21 ms | 0 finished in 30 s | 576 | 94.7 / 21 ms | 0 finished in 45 s |
+| xfs mmap 4 KiB at steady-90's rate, sync every 1 s | 315 | 11.3 / 78 | 44, 969 ms, 986 ms | 322 | 40.2 / 165 | 44, 944 ms, 947 ms |
+| xfs write 128 KiB, unthrottled, sync every 256 MiB | 346 | 22.7 / 83 | 59, 759 ms, 761 ms | 337 | 41.7 / 68 | 57, 759 ms, 760 ms |
+| RAID 0 of both SSDs, raw, 128 KiB / 1 MiB, QD 32 | | | | 703 / 703 | 8.3 ms / 63 ms (p99.9) | – |
+| RAID 0, ext4 write 128 KiB, unthrottled, sync every 256 MiB | | | | 636 | 45.3 / 141 | 107, 375 ms, 383 ms |
+| RAID 0, ext4 mmap 4 KiB at steady-90's rate, sync every 1 s | | | | 328 | 106 / 1.5 ms | 45, 468 ms, 473 ms |
+
+On the second aarch64 VM (below), at steady-90's byte rate (324 MB/s), 45 s, `fdatasync` every second from another
+process: `write` 128 KiB with `sync_file_range(SYNC_FILE_RANGE_WRITE)` every 1 MiB (tickertape's write-back step)
+wrote with p99.99 68 µs and a maximum of 104 µs, its 42 syncs took 9.8 ms (p50) and at most 15 ms; mmap 4 KiB with the
+same (fio's mmap engine turns the range sync into an `msync`, 0.5 ms each) at most 136 µs, syncs 10 ms and at most 16
+ms; `write` 128 KiB without the range syncs had one write of 122 ms and 6 syncs of 4.6–10.3 s.
+
+- The cap is the platform's, not the flash's: a flat 351 MB/s whatever the request size and depth, on both machine
+  types; queueing deeper only adds latency (12–96 ms at QD 32). 4 KiB writes at QD 1 took 16 µs on aarch64 and 29 µs
+  on x86-64. The devices report a write-through cache, so `fdatasync` sends no flush and costs nothing beyond the
+  writes (16 and 30 µs); a drive with a volatile cache would add a flush to every checkpoint (further tests, below).
+- Buffered writers get the cap too: unthrottled fio in the page cache wrote 310–346 MB/s, and one second of
+  steady-90's data took 0.92–0.94 s to sync (one second of steady-50's 0.51–0.52 s), the time the device needs for it
+  at 351 MB/s. That is also what a tickertape checkpoint costs without early write-back (0.93 s, below).
+- fio's own writes waited at most 0.07–0.14 ms at steady-90's rate when it synced on its writing thread (where it
+  never writes while a sync runs) or used tickertape's write-back pattern, and at most 0.8–1.7 ms with an `fdatasync`
+  from another process and no range syncs, except the one 122 ms write above. An `fdatasync` from another process while the writer keeps going takes much longer than one second's
+  data (4–11 s at steady-90; none finished unthrottled), unlike tickertape's checkpoint, which syncs up to a recorded
+  position with a ranged `msync` before its whole-file `fdatasync`.
+
+### Without a disk (tmpfs) against the SSD
+
+On tmpfs `fdatasync` and `msync` return at once and `sync_file_range` does nothing: **this row has no durability at
+all; it is a ceiling, not a mode to recommend.** What remains on tmpfs is the library's and the kernel's own cost:
+appends, rolls, unmapping, scheduling, the helper threads.
+
+| Payload | Arch | tmpfs: runs, records/s | MB/s | SSD (ext4): runs, records/s | MB/s | Writer off-CPU on the SSD (s of 70) | Page cache dirty at most (GiB) |
+|---|---|---|---|---|---|---|---|
+| 64 | aarch64 | 2: 4,003,436–4,021,481 | 416–418 | 2: 3,341,813–3,349,920 | 348 | 4.4–6.1 | 0.1–0.2 |
+| 64 | x86-64 | 2: 3,787,930–4,035,725 | 394–420 | 2: 3,362,791–3,372,591 | 350–351 | 0.1 | 0.0–0.1 |
+| 256 | aarch64 | 1: 3,249,920 | 962 | 1: 1,453,768 | 430 | 32.6 | 5.1 |
+| 256 | x86-64 | 1: 2,883,171 | 853 | 1: 1,712,425 | 507 | 26.7 | 10.6 |
+| 1,024 | aarch64 | 2: 1,686,719–1,699,041 | 1,795–1,808 | 3: 402,668–407,959 | 428–434 | 53.9–54.1 | 5.1–5.4 |
+| 1,024 | x86-64 | 2: 1,322,402–1,657,601 | 1,407–1,764 | 3: 475,943–476,579 | 506–507 | 43.8–45.1 | 10.1–10.2 |
+| 4,096 | aarch64 | 1: 555,930 | 2,299 | 1: 105,009 | 434 | 62.8 | 5.4 |
+| 4,096 | x86-64 | 1: 476,872 | 1,972 | 1: 122,381 | 506 | 58.8 | 10.1 |
+| 1,024 | x86-64, RAID 0 of both SSDs | | | 2: 798,645–799,730 | 850–851 | 24.5–25.2 | 9.7 |
+
+The two x86-64 tmpfs runs at 1,024 B differ by 25 % (1,407 and 1,764 MB/s; append p50 0.47 and 0.12 µs), more than
+some effects in this section; the x86-64 tmpfs figures are a range, not a rate. Subtracting what was still dirty at the
+end, about 347 MB/s (aarch64) and 350 MB/s (x86-64) reached the device in the 1,024 B SSD runs: its cap.
+
+At the same rate (unpaced rows above; "Seconds ≥ 10 ms" lists each run):
+
+| Scenario | Payload | Arch | Storage | Runs | Late (%) | Append p99.9 | p99.99 | max | Roll append p50 | Seconds ≥ 10 ms | Mapped reader p99.9 | Safe reader p99.9 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| steady-50 | 64 | aarch64 | SSD (ext4) | 1 | 1.5 | 2.02 | 3.54 | 211 | 175 | 0 | 266 | 39.8 |
+| steady-50 | 64 | aarch64 | tmpfs | 1 | 4.7 | 1.90 | 2.60 | 20 ms | 19 ms | 59 | 19 ms | 18 ms |
+| steady-50 | 64 | x86-64 | SSD (ext4) | 1 | 8.5 | 2.07 | 6.72 | 381 | 133 | 0 | 114 | 83.8 |
+| steady-50 | 64 | x86-64 | tmpfs | 1 | 5.5 | 1.80 | 6.07 | 31 ms | 27 ms | 59 | 28 ms | 27 ms |
+| steady-50 | 1,024 | aarch64 | SSD (ext4) | 1 | 0.8 | 7.59 | 32.0 | 203 | 175 | 0 | 269 | 27.8 |
+| steady-50 | 1,024 | aarch64 | tmpfs | 1 | 2.9 | 2.46 | 4.05 | 20 ms | 19 ms | 60 | 19 ms | 18 ms |
+| steady-50 | 1,024 | x86-64 | SSD (ext4) | 1 | 1.4 | 5.97 | 18.6 | 205 | 149 | 0 | 76.0 | 24.0 |
+| steady-50 | 1,024 | x86-64 | tmpfs | 1 | 4.4 | 2.83 | 6.56 | 29 ms | 27 ms | 60 | 28 ms | 27 ms |
+| steady-90 | 64 | aarch64 | SSD (ext4) | 2 | 5.1–5.2 | 1.90–1.94 | 3.19–3.27 | 1.0–10 ms | 171–249 | 1, 0 | 744 to 1.5 ms | 263 to 1.5 ms |
+| steady-90 | 64 | aarch64 | tmpfs | 2 | 17.9 | 1.83 | 2.66–2.91 | 20–21 ms | 19 ms | 60, 60 | 20 ms | 19 ms |
+| steady-90 | 64 | x86-64 | SSD (ext4) | 1 | 33.7 | 1.90 | 6.85 | 176 | 119 | 0 | 548 | 503 |
+| steady-90 | 64 | x86-64 | tmpfs | 1 | 18.9 | 1.81 | 6.00 | 29 ms | 28 ms | 60 | 29 ms | 27 ms |
+| steady-90 | 1,024 | aarch64 | SSD (ext4) | 4 | 3.8–9.9 | 3.78–4.09 | 27.1–28.6 | 83–144 ms | 175–912 | 36, 19, 32, 25 | 48–129 ms | 48–129 ms |
+| steady-90 | 1,024 | aarch64 | tmpfs | 2 | 5.3–5.4 | 2.39–2.41 | 3.89–4.16 | 20–21 ms | 19 ms | 60, 60 | 20 ms | 18 ms |
+| steady-90 | 1,024 | aarch64 | tmpfs, spare segment | 1 | 0.4 | 2.43 | 4.27 | 48.2 | 38.2 | 0 | 1.2 ms | 11.4 |
+| steady-90 | 1,024 | x86-64 | SSD (ext4) | 3 | 2.5–3.5 | 5.46–6.55 | 9.32–11.2 | 245–638 | 147–154 | 0, 0, 0 | 342–368 | 43.3–53.7 |
+| steady-90 | 1,024 | x86-64 | tmpfs | 2 | 7.9 | 2.85–2.87 | 6.99–7.04 | 31–33 ms | 27–28 ms | 59, 59 | 28–29 ms | 27 ms |
+| steady-90 | 1,024 | x86-64 | tmpfs, spare segment | 1 | 0.6 | 2.67 | 6.95 | 100 | 25.6 | 0 | 968 | 10.9 |
+
+- **tmpfs has a cost of its own at every roll.** A roll appends in 19 ms (aarch64) and 27–30 ms (x86-64) on tmpfs
+  against 0.12–0.25 ms on ext4: `fallocate` on tmpfs allocates and zeroes the whole 128 MiB segment, on the writer's
+  thread. The traced runs (`offcpu.bt`, waits of 1 ms or more; unpaced and steady-90 at 1,024 B on each machine) show
+  no wait of the writer's thread of 1 ms or more during the measured minute (only preemptions of 2–3 ms one second
+  after the start, in the warm-up, and one sleep of 10 ms after the aarch64 steady-90 run ended): those roll appends are CPU time in
+  the kernel (the writer's system time is 22.6 s for 801 rolls on aarch64, 22–32 s for 631–803 rolls on x86-64). The
+  same cost makes the readers' p99.9 on tmpfs 18–29 ms. With the spare segment the zeroing moves to the spare's thread:
+  rolls append in 26–38 µs and the writer's maximum at steady-90 is 48 µs (aarch64) and 100 µs (x86-64). Unpaced at
+  2.1–2.4 GB/s a spare is sometimes not ready (roll maxima 4.5 ms on aarch64 and 33 ms on x86-64).
+- **What the storage stack costs per append** (steady-90, 1,024 B, against tmpfs with a spare): p99.9 1.4–1.7 µs
+  (aarch64) and 2.8–3.9 µs (x86-64) more, p99.99 23–24 µs (aarch64) and 2.4–4.3 µs (x86-64) more; at 64 B the p99.9
+  and p99.99 of SSD and tmpfs are within 0.1–1 µs of each other (roll appends aside). These are the store faults on a
+  file-backed mapping (ext4's `page_mkwrite`) and, on aarch64, the waits below.
+- **What stays without a disk:** in every paced tmpfs run p99 of 0.2–0.4 µs (64 B) and 2.0–2.2 µs (1,024 B), p99.9
+  1.8–2.9 µs and p99.99 2.6–7.0 µs, and the readers' wake-ups: the mapped reader's p99.9 on tmpfs with a spare was 1.2 ms (aarch64)
+  and 0.97 ms (x86-64), not better than on x86-64's SSD (0.34–0.37 ms); one run each, not looked into.
+
+### One change at a time on the SSD (1,024 B)
+
+Rows in the order run, the base interleaved (two base runs in the first pass of the payload sweep and the change
+block, the others after it; the aarch64 base runs `-r2` and the extra early-write-back-off runs after the session's
+end, interleaved). Large dirty limits: 8 / 16 GiB on aarch64, 16 / 32 GiB on x86-64.
+
+aarch64, steady-90 (304,571 records/s, 324 MB/s, 92 % of the device):
+
+| Configuration | Runs | Late sends (%) | Seconds with an append ≥ 10 ms | ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | To durable p50 | To durable max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 4 | 3.8–9.9 | 36, 19, 32, 25 | 26, 5, 28, 2 | 27.1–28.6 | 83–144 ms | 175–912 | 3.3–92 ms | 48–129 ms | 273–391 ms | 496–836 ms |
+| no checkpoints (and no durable-only reader) | 1 | 1.2 | 0 | 0 | 26.7 | 1.3 ms | 887 | 1.1 ms | 714 | – | – |
+| early write-back off | 3 | 0.4–0.7 | 0, 0, 0 | 0, 0, 0 | 4.20–4.42 | 1.1–2.3 ms | 177 to 1.1 ms | 358 to 2.3 ms | 537 to 1.5 ms | 926 ms | 1.15 s |
+| ext4 `lazytime` | 1 | 1.3 | 3 | 2 | 27.5 | 82 ms | 186 | 82 ms | 52 ms | 332 ms | 674 ms |
+| spare segment on | 1 | 6.1 | 23 | 21 | 27.1 | 138 ms | 48.7 | 59.0 | 125 ms | 379 ms | 721 ms |
+| dirty limits 64 / 256 MiB | 1 | 10.0 | 29 | 22 | 28.3 | 142 ms | 176 | 1.6 ms | 132 ms | 360 ms | 963 ms |
+| dirty limits large (below) | 1 | 5.5 | 20 | 19 | 28.1 | 141 ms | 175 | 201 | 126 ms | 409 ms | 722 ms |
+| xfs (second local SSD) | 1 | 0.9 | 1 | 1 | 21.6 | 123 ms | 145 | 123 ms | 71 ms | 409 ms | 827 ms |
+| tmpfs | 2 | 5.3–5.4 | 60, 60 | 0, 0 | 3.89–4.16 | 20–21 ms | 19 ms | 20–21 ms | 20 ms | 41.6–43.0 | 50.4–53.3 |
+| tmpfs, spare segment on | 1 | 0.4 | 0 | 0 | 4.27 | 48.2 | 38.2 | 48.2 | 1.2 ms | 39.3 | 52.6 |
+
+aarch64, unpaced:
+
+| Configuration | Runs | MB/s | Writer off-CPU (s of 70) | Seconds with an append ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | Dirty max (GiB) | To durable p50 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 3 | 428–434 | 53.9–54.1 | 29, 36, 30 | 13–15 ms | 303–376 ms | 195 to 3.9 ms | 101–224 ms | 607–631 | 5.1–5.4 | 31.37–33.00 s |
+| no checkpoints (and no durable-only reader) | 1 | 430 | 56.8 | 5 | 14 ms | 363 ms | 1.4 ms | 101 ms | 12.3 | 5.1 | – |
+| early write-back off | 1 | 426 | 54.0 | 10 | 14 ms | 271 ms | 184 | 25 ms | 622 | 5.2 | 23.12 s |
+| ext4 `lazytime` | 1 | 434 | 53.9 | 19 | 15 ms | 305 ms | 7.8 ms | 305 ms | 618 | 5.4 | 33.64 s |
+| spare segment on | 1 | 433 | 53.8 | 25 | 15 ms | 347 ms | 48.4 | 99 ms | 667 | 5.5 | 34.12 s |
+| dirty limits 64 / 256 MiB | 1 | 352 | 57.3 | 51 | 8.5 ms | 517 ms | 187 | 339 ms | 55 ms | 0.2 | 1.16 s |
+| dirty limits large (below) | 1 | 569 | 48.3 | 25 | 15 ms | 337 ms | 3.3 ms | 188 ms | 630 | 14.4 | 70.73 s |
+| xfs (second local SSD) | 1 | 430 | 54.8 | 0 | 14 ms | 26 ms | 161 | 25 ms | 642 | 5.1 | 32.40 s |
+| tmpfs | 2 | 1,795–1,808 | 0.0 | 0, 0 | 4.68–4.82 | 22–23 ms | 21 ms | 22–23 ms | 1.6–2.3 ms | 0.0 | 2.5 ms |
+| tmpfs, spare segment on | 1 | 2,375 | 0.0 | 0 | 4.85 | 10 ms | 2.5 ms | 4.5 ms | 2.2 ms | 0.0 | 2.5 ms |
+
+x86-64, steady-90 (311,614 records/s, 332 MB/s, 94 % of the device):
+
+| Configuration | Runs | Late sends (%) | Seconds with an append ≥ 10 ms | ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | To durable p50 | To durable max |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 3 | 2.5–3.5 | 0, 0, 0 | 0, 0, 0 | 9.32–11.2 | 245–638 | 147–154 | 183–638 | 342–368 | 1.7–2.3 ms | 3.6–5.1 ms |
+| no checkpoints (and no durable-only reader) | 1 | 2.8 | 0 | 0 | 8.77 | 1.1 ms | 999 | 1.1 ms | 711 | – | – |
+| early write-back off | 1 | 1.5 | 0 | 0 | 9.03 | 557 | 180 | 557 | 437 | 933 ms | 1.15 s |
+| ext4 `lazytime` | 1 | 3.2 | 0 | 0 | 11.4 | 691 | 155 | 691 | 366 | 2.0 ms | 4.5 ms |
+| spare segment on | 1 | 2.8 | 0 | 0 | 9.92 | 293 | 46.9 | 66.2 | 247 | 1.6 ms | 3.7 ms |
+| dirty limits 64 / 256 MiB | 1 | 3.0 | 0 | 0 | 11.1 | 353 | 149 | 196 | 347 | 1.8 ms | 4.0 ms |
+| dirty limits large (below) | 1 | 2.6 | 0 | 0 | 9.53 | 865 | 147 | 865 | 344 | 1.7 ms | 3.7 ms |
+| xfs (second local SSD) | 1 | 2.5 | 0 | 0 | 8.92 | 576 | 140 | 576 | 296 | 1.4 ms | 1.9 ms |
+| two local SSDs in RAID 0, ext4 | 2 | 3.2–3.4 | 0, 0 | 0, 0 | 89.3–90.9 | 2.4–2.6 ms | 139–142 | 161–172 | 620–635 | 116–190 ms | 288–312 ms |
+| tmpfs | 2 | 7.9 | 59, 59 | 0, 0 | 6.99–7.04 | 31–33 ms | 27–28 ms | 31–33 ms | 28–29 ms | 49.2–170 | 245–256 |
+| tmpfs, spare segment on | 1 | 0.6 | 0 | 0 | 6.95 | 100 | 25.6 | 43.3 | 968 | 38.4 | 55.1 |
+
+x86-64, unpaced:
+
+| Configuration | Runs | MB/s | Writer off-CPU (s of 70) | Seconds with an append ≥ 50 ms | Append p99.99 | Append max | Roll append p50 | Roll append max | Mapped reader p99.9 | Dirty max (GiB) | To durable p50 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| ext4, defaults (base) | 3 | 506–507 | 43.8–45.1 | 29, 15, 1 | 13–14 ms | 273–437 ms | 173 to 11 ms | 273–437 ms | 481–793 | 10.1–10.2 | 51.98–52.41 s |
+| no checkpoints (and no durable-only reader) | 1 | 506 | 47.6 | 4 | 14 ms | 73 ms | 2.5 ms | 73 ms | 12.3 | 10.1 | – |
+| early write-back off | 1 | 502 | 45.1 | 18 | 13 ms | 351 ms | 8.2 ms | 351 ms | 567 | 10.2 | 44.33 s |
+| ext4 `lazytime` | 1 | 507 | 44.2 | 25 | 13 ms | 253 ms | 8.7 ms | 253 ms | 532 | 10.2 | 51.61 s |
+| spare segment on | 1 | 507 | 44.6 | 0 | 13 ms | 27 ms | 39.6 | 10 ms | 575 | 10.1 | 52.04 s |
+| dirty limits 64 / 256 MiB | 1 | 354 | 52.1 | 33 | 7.5 ms | 358 ms | 339 | 220 ms | 879 | 0.2 | 1.11 s |
+| dirty limits large (below) | 1 | 783 | 30.4 | 13 | 17.1 | 348 ms | 2.3 ms | 348 ms | 456 | 28.5 | 106.43 s |
+| xfs (second local SSD) | 1 | 503 | 45.5 | 1 | 13 ms | 56 ms | 168 | 56 ms | 540 | 9.8 | 50.33 s |
+| two local SSDs in RAID 0, ext4 | 2 | 850–851 | 24.5–25.2 | 4, 13 | 102–105 | 212–227 ms | 144–149 | 125–155 ms | 8.46–8.54 | 9.7 | 28.12–28.92 s |
+| tmpfs | 2 | 1,407–1,764 | 0.0–1.2 | 0, 0 | 7.18–13.9 | 32–35 ms | 29–30 ms | 32–35 ms | 1.7–3.6 ms | 0.0 | 1.8–2.0 ms |
+| tmpfs, spare segment on | 1 | 2,073 | 0.0 | 0 | 7.55 | 33 ms | 1.7 ms | 33 ms | 2.1 ms | 0.0 | 1.9 ms |
+
+The second aarch64 VM (`c4a-standard-8-lssd`, us-east1-b, 12:44–13:00, the same build; steady-90, 1,024 B, two runs
+each, interleaved; device sectors written from `/proc/diskstats` around each run):
+
+| Configuration | Runs | Seconds with an append ≥ 10 ms | Append p99.99 | Append max | Mapped reader p99.9 | To durable p50 | Device writes per run |
+|---|---|---|---|---|---|---|---|
+| ext4, defaults | 2 | 2, 1 | 28.8–29.3 | 10–16 ms | 3.3–6.4 ms | 46–73 ms | 24.36–24.39 GB |
+| early write-back off | 2 | 0, 0 | 4.10–4.28 | 1.0–1.1 ms | 453–465 | 928–929 ms | 22.70 GB |
+
+The records of a run (70 s at 324 MB/s) are 22.68 GB; fio's jobs at the same rate wrote 14.58 GB (`write` with range
+syncs, its data exactly) and 14.82 GB (mmap) in 45 s. The extra 1.7 GB per run (about 24 MB/s) is far more than the
+prefaulted window that each checkpoint writes as zeros (about 268 KiB a second, 2026-11-26, "what prefaulted,
+unwritten pages add to a checkpoint", above); that section also found more device writes with early write-back on
+(0.7–2.3 MiB per checkpoint at 21 MB/s), not investigated there either.
+
+- **Noise.** The base at aarch64 steady-90 drifted during the first session: 26 and 28 seconds with an append of 50
+  ms or more in the first two runs, 2 and 5 in the last two; on the second VM 0 and 0 (maxima 10–16 ms). From 10:52
+  on, every SSD run on that VM had a roll append p50 of 0.8–1.3 ms instead of 171–195 µs, with the same command; not
+  explained. On x86-64 the unpaced base had 29, 15 and 1 seconds with an append of 50 ms or more: no unpaced change
+  can be told from the base by that count. Every other row is one run.
+- **Early write-back off is the only change that removed the aarch64 stalls in every run** (5 of 5 on two VMs, against
+  every base run having appends of 10 ms or more, 10–144 ms at most), and with them the extra 7 % of device writes; its
+  p99.99 (4.1–4.4 µs) is tmpfs's. Its cost is the checkpoint: durable 0.93 s after the request (p50; at most 1.15 s)
+  instead of 0.05–0.39 s on aarch64 and 1.7–2.3 ms on x86-64, where the tail did not change (no stall either way). The
+  mechanism consistent with these figures, not traced here: with the device near its cap the queue holds write-back
+  that the ext4 journal's commit must wait behind (2026-11-25, "Where the writer's thread waits"), and the default
+  configuration both keeps that queue full and adds 7 % to it.
+- No checkpoints (one run): no stall either, at the cost of having no durability point. `lazytime` (one run): 3
+  seconds with an append of 10 ms or more, the longest a roll (82 ms), as in the 2026-11-25 runs. xfs (one run): one
+  roll of 123 ms, nothing else above 10 ms. The spare segment and either dirty limit: no change at steady-90.
+- **Unpaced**, nothing changed the rate except the dirty limits, which only change how much the page cache takes in
+  before the writer is throttled: small limits give the device's rate (352–354 MB/s) with checkpoints durable in about
+  1.1 s but the longest appends (358–517 ms, 33–51 seconds with 50 ms or more); large ones give 569–783 MB/s over 70 s
+  by holding 14–29 GiB dirty, with checkpoints a minute or more behind. xfs (aarch64 26 ms, x86-64 56 ms) and, on
+  x86-64, the spare segment (27 ms) had far lower append maxima than every base run on their machine (303–376 and
+  273–437 ms); one run each.
+- **RAID 0** (x86-64, two runs each): unpaced, 850–851 MB/s, the writer off-CPU 25 s instead of 44–45. At steady-90 it
+  made the tail worse: p99.99 89–91 µs against 9.3–11.2, maximum 2.4–2.6 ms against 0.25–0.64, checkpoints durable
+  after 116–190 ms against 2 ms. md's RAID 0 with 512 KiB chunks was not tuned or traced.
+
+### What would test it further
+
+Ranked by what it would tell against what it costs (cloud prices of this session):
+
+1. **Find the extra 7 % of device writes** (`blktrace` or a `block_rq_issue` probe by sector and file offset, default
+   against early write-back off, on aarch64 and x86-64, steady-90 and steady-50): whether pages are written twice and
+   why (ext4's conversion of unwritten extents, the journal; the prefaulted window that every checkpoint writes as
+   zeros is only about 268 KiB a second, 2026-11-26 "what prefaulted, unwritten pages add to a checkpoint", above, which
+   also saw 0.7–2.3 MiB more per checkpoint with early write-back on at 21 MB/s and did not look further). It is the only finding here that may be the library's to fix, and it may also explain why aarch64 falls
+   behind at 92 % of the cap while x86-64 keeps up at 94 % (x86-64's device bytes were not counted). About 30 minutes
+   on each shape: under A$1.
+2. **Map the knee:** steady rates at 80, 85, 90 and 95 % of the device's 351 MB/s, both payloads, 10-minute runs, with
+   and without early write-back, on the aarch64 shape (64 B at 89 % did not stall, 1,024 B at 92 % did). It would turn
+   "keep headroom" into a number for these devices. About 1.5 hours of `c4a-standard-8-lssd`: about A$1.1.
+3. **Network block storage**, which many users have instead of local NVMe: Hyperdisk Balanced or Extreme with
+   provisioned throughput (for example 500 MB/s) and IOPS, the same fio yardstick and scenarios. Higher per-request
+   latency (hundreds of µs), a different queue and possibly flushes. A session like this one on a `c4-standard-8` with
+   a provisioned 1 TB volume: about A$3–5 (the volume's provisioned throughput and IOPS cost by the hour).
+4. **Faster local storage**: the same shape family with four local SSDs striped (`c4a-standard-16-lssd`, about A$1.5
+   an hour) or a Z3 shape: shows whether tickertape keeps following the device past 1 GB/s and where the CPU limit
+   (tmpfs: 1.4–2.3 GB/s at 1–4 KiB on these CPUs) takes over, and whether md RAID 0 always costs this much latency at
+   paced rates.
+5. **One short bare-metal session with a known NVMe drive** (not run; the owner has skipped bare metal for now, and the
+   AWS credits could pay for it: `i4i.metal` or `z1d.metal` for one to two hours, about US$5–25 of credits). What it
+   would add that these VMs cannot: a real drive without the platform's flat rate cap, so its own behaviour shows
+   (write cache exhaustion, garbage collection, sustained rate after minutes, latency spikes that no limiter smooths);
+   real flush cost if the drive reports a volatile cache; no hypervisor in the I/O path; the fio yardstick against a
+   datasheet. The comparison: the same fio jobs and tickertape scenarios as here, 10-minute runs.
+6. **A drive with power-loss protection against one without**, for the checkpoint's sync: these cloud SSDs report a
+   write-through cache, so `fdatasync` sent no flush and checkpoints paid only for the writes. A consumer NVMe drive
+   with a volatile cache adds a FLUSH to every `fdatasync` (often milliseconds, more under load); a drive with
+   power-loss protection acknowledges it at once. Needs physical hardware (or a bare-metal instance whose drive model
+   is known); the fio job `4k, QD 1, fdatasync after each` above is the measure.
+
+### What these figures do not show
+
+One VM per architecture for the main session (and a second aarch64 VM for 16 minutes); runs of 60 s, so a 10-minute
+run has ten times the rolls and stalls, and an unpaced 60 s run is still filling the page cache (70 s runs flatter it
+by about 80 MB/s on aarch64 and 155 MB/s on x86-64). Most changes ran once. One device type (Google's local NVMe behind its
+rate cap), no network storage, no bare metal. The `fio` jobs approximate a journal: one thread, no readers, no prefault
+helper, no checkpoint thread except the `sync -d` loop, which syncs the whole file. Device bytes were counted only on
+the second aarch64 VM. Retention was 4 GiB, not the sessions' 64 GiB. The traced runs were the tmpfs runs only.
 
 ## 2026-11-26, the layout of `Reader` (ADR 0057, issue #86; Google Cloud VMs)
 

@@ -154,6 +154,11 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   Linux**, where the writer behaves as before; on by default on macOS, as today, and now separate from `prefault`. On
   cloud VMs it made rolls cheaper away from the disk's limit, made the one saturated case worse and was not measured in others. The
   file format and the crash contract's guarantees are unchanged.
+- Docs: how much of the throughput limit and of the latency tail on the cloud VMs is the disk (issue #60):
+  `docs/benchmarks.md` has `fio` on the same local SSDs (capped at 351 MB/s), the sustained scenarios with the journal
+  on tmpfs, one storage setting at a time, a payload sweep and the two SSDs striped. `docs/operations.md` → Writer threads
+  says how to tell whether the disk is the limit and which settings moved the tail (early write-back off removed the
+  aarch64 stalls at 92 % of the device's rate, at the cost of checkpoints durable after about 0.9 s).
 - Docs: the stalls of sustained runs on ext4 are attributed (issue #60): the write fault's modification-time update and
   a roll's file operations wait for the ext4 journal; that the holder of `mmap_lock` in the unpaced rolls is the prefault
   helper is inferred, and why the device queues on one machine shape is not explained. With the measured effect of
