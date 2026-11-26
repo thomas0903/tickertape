@@ -636,6 +636,54 @@ fn full_volume_then_write_into_preallocated_segment() {
     assert_eq!(read_all(&journal).len(), 60_000);
 }
 
+/// A roll whose segment fails after its blocks were preallocated (here: mapping it) gives them back even while another
+/// descriptor of the temporary file is open, as a child process forked at that moment holds one until it executes its
+/// new program (ADR 0049 → amendment of 2026-11-27): ext4 keeps the blocks of a partial preallocation too.
+#[test]
+fn a_failed_roll_gives_its_blocks_back_while_its_file_is_open_elsewhere() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    // Without the prefault helper no spare is prepared (ADR 0022): the roll creates its segment itself.
+    let mut w = Writer::open(dir.path(), small_config().prefault(false)).unwrap();
+    let max = tickertape::format::max_payload_len(SMALL_SEGMENT) as usize;
+    let data = vec![3u8; max];
+    let rec = NewRecord {
+        schema_id: 0,
+        venue_ts_ns: 0,
+        local_ts_ns: 0,
+        payload: &data,
+    };
+    w.append(&rec).unwrap();
+    let tmp = dir.path().join("00000000000000000001.tape.tmp");
+    let elsewhere = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = std::rc::Rc::clone(&elsewhere);
+    let opened = tmp.clone();
+    fault::run_at(Point::MapSegment, 0, move || {
+        *slot.borrow_mut() = Some(std::fs::File::open(&opened).unwrap());
+    });
+    fault::fail_next(Point::MapSegment, 12 /* ENOMEM */);
+    assert!(matches!(
+        w.append(&rec),
+        Err(Error::Io {
+            op: "map segment",
+            ..
+        })
+    ));
+    let file = elsewhere
+        .borrow_mut()
+        .take()
+        .expect("the hook ran after the preallocation");
+    assert!(!tmp.exists());
+    let left = file.metadata().unwrap();
+    assert_eq!(
+        (left.len(), left.blocks()),
+        (0, 0),
+        "the failed roll's file kept its blocks while open elsewhere"
+    );
+    assert_eq!(w.append(&rec).unwrap(), 1);
+    assert_eq!(read_all(dir.path()).len(), 2);
+}
+
 #[test]
 fn map_failure_during_roll_is_retried() {
     // Review finding: a mapping failure after publishing the new segment used to make every retry fail with

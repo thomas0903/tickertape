@@ -231,12 +231,19 @@ fn failed_header_write_discards_the_spare_and_creates_the_segment() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = Writer::open(dir.path(), config()).unwrap();
     wait_for_ready_spare(&mut w, dir.path());
-    // Keep the spare open: otherwise a filesystem may give the replacement the freed inode number (ext4 does).
-    let _hold = std::fs::File::open(dir.path().join(SPARE)).unwrap();
+    // Keep the spare open: otherwise a filesystem may give the replacement the freed inode number (ext4 does). Open
+    // elsewhere, the discarded spare must still give its blocks back.
+    let hold = std::fs::File::open(dir.path().join(SPARE)).unwrap();
     let prepared = identity(&dir.path().join(SPARE));
     fault::fail_next(Point::SpareHeader, 5 /* EIO */);
     fill_until_roll(&mut w, dir.path(), 1);
     fault::clear();
+    let left = hold.metadata().unwrap();
+    assert_eq!(
+        (left.len(), left.blocks()),
+        (0, 0),
+        "the discarded spare kept its blocks while open elsewhere"
+    );
     assert!(
         !dir.path().join(SPARE).exists(),
         "the discarded spare was left behind"
@@ -549,6 +556,9 @@ fn a_panicked_spare_thread_neither_blocks_rolls_nor_keeps_its_space() {
         }
         wait_for(gone, "the spare thread to panic");
         assert!(spare.exists(), "the panicked thread's file");
+        // Open elsewhere too (as by a forked child): removing the file must still give its blocks back.
+        let elsewhere = std::fs::File::open(&spare).unwrap();
+        assert!(elsewhere.metadata().unwrap().blocks() > 0);
         fill_until_roll(&mut w, &path, 2); // rolls create their segments
         assert!(w.spare_settled());
         assert!(spare.exists());
@@ -557,6 +567,13 @@ fn a_panicked_spare_thread_neither_blocks_rolls_nor_keeps_its_space() {
         fill_until_roll(&mut w, &path, 1);
         fault::clear();
         assert!(!spare.exists(), "the panicked thread's file was kept");
+        let left = elsewhere.metadata().unwrap();
+        assert_eq!(
+            (left.len(), left.blocks()),
+            (0, 0),
+            "the panicked thread's file kept its blocks while open elsewhere"
+        );
+        drop(elsewhere);
         fill_until_roll(&mut w, &path, 2); // no spare is asked for any more
         assert!(!spare.exists());
         let total = w.next_seq();

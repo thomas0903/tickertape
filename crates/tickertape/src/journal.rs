@@ -37,12 +37,32 @@ pub(crate) fn tmp_path(dir: &Path, base_seq: u64) -> PathBuf {
 
 /// Gives the blocks of an unpublished segment file (a temporary segment or the spare, `file` opened at `path`) back to
 /// the filesystem and removes its name. Truncated first: unlinking and closing free nothing while another descriptor
-/// of the file is open, such as the copy a child process forked at that moment holds until its `exec`, and the roll
-/// that has just run out of space tries again right after (ADR 0049 → amendment of 2026-11-27). Errors are ignored:
-/// the name is a leftover the next open removes.
-pub(crate) fn discard_unpublished(file: &File, path: &Path) {
-    let _ = file.set_len(0);
-    let _ = fs::remove_file(path);
+/// of the file is open, such as the copy a child process forked at that moment holds until it executes its new
+/// program, and the roll that has just run out of space tries again right after (ADR 0049 → amendment of 2026-11-27).
+/// Only a regular file with no other name is truncated: a second name means it is, or is becoming, a segment, whose
+/// records must never be destroyed (a `link` that reports an error after taking effect, as NFS can). A descriptor
+/// held elsewhere does not change the link count. Returns the result of removing the name; callers may ignore it, as
+/// a name left behind is a leftover the next open removes.
+pub(crate) fn discard_unpublished(file: &File, path: &Path) -> io::Result<()> {
+    if file.metadata().is_ok_and(|m| m.is_file() && m.nlink() == 1) {
+        let _ = file.set_len(0);
+    }
+    fs::remove_file(path)
+}
+
+/// [`discard_unpublished`] of the file at `path`, which this process has no descriptor of (the one a panicked spare
+/// thread left). Opened without following a symbolic link and without blocking (a FIFO); if it cannot be opened, the
+/// name is only removed. Returns the result of removing the name.
+pub(crate) fn discard_unpublished_at(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(file) = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        return discard_unpublished(&file, path);
+    }
+    fs::remove_file(path)
 }
 
 /// Lists the segments in `dir` as `(base_seq, path)`, sorted by `base_seq`.
@@ -520,6 +540,51 @@ fn with_pread_view<R>(file: &File, path: &Path, f: impl FnOnce(&PreadView<'_>) -
         return Err(Error::io("read segment", path, e));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use super::*;
+
+    /// A file with a second name (a segment, or one becoming one) keeps its length and contents: only its other name
+    /// is removed.
+    #[test]
+    fn a_file_with_another_name_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("00000000000000000007.tape.tmp");
+        let published = segment_path(dir.path(), 7);
+        fs::write(&tmp, vec![0x5a; 8192]).unwrap();
+        fs::hard_link(&tmp, &published).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&tmp).unwrap();
+        discard_unpublished(&file, &tmp).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(&published).unwrap(), vec![0x5a; 8192]);
+        // With only one name left, the same call truncates it.
+        discard_unpublished(&file, &published).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    /// The by-name variant never follows a symbolic link at the name: the target keeps its contents, the link goes.
+    #[test]
+    fn a_symbolic_link_at_the_name_is_removed_and_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, vec![0x5a; 8192]).unwrap();
+        let name = dir.path().join(SPARE_FILE);
+        std::os::unix::fs::symlink(&target, &name).unwrap();
+        discard_unpublished_at(&name).unwrap();
+        assert!(fs::symlink_metadata(&name).is_err(), "the link was kept");
+        assert_eq!(fs::read(&target).unwrap(), vec![0x5a; 8192]);
+        // A regular file at the name, open elsewhere: its blocks go back.
+        fs::write(&name, vec![0x5a; 8192]).unwrap();
+        let elsewhere = File::open(&name).unwrap();
+        discard_unpublished_at(&name).unwrap();
+        assert_eq!(elsewhere.metadata().unwrap().len(), 0);
+        assert!(
+            discard_unpublished_at(&name).is_err(),
+            "nothing left to remove"
+        );
+    }
 }
 
 #[cfg(test)]

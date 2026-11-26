@@ -330,7 +330,7 @@ impl Spare {
     pub(crate) fn discard(self, path: &Path) {
         let Spare { file, map, .. } = self;
         drop(map);
-        crate::journal::discard_unpublished(&file, path);
+        let _ = crate::journal::discard_unpublished(&file, path);
     }
 }
 
@@ -520,11 +520,8 @@ impl Spares {
                     // A thread that panicked leaves its file, and the blocks it took: they are freed here.
                     None if ended => {
                         let path = self.dir.join(crate::journal::SPARE_FILE);
-                        // Truncated first, as a failed preparation does ([`crate::journal::discard_unpublished`]).
-                        if let Ok(file) = OpenOptions::new().write(true).open(&path) {
-                            let _ = file.set_len(0);
-                        }
-                        let removed = fs::remove_file(&path);
+                        // Truncated first, as a failed preparation's file is.
+                        let removed = crate::journal::discard_unpublished_at(&path);
                         if removed.is_ok() {
                             Waited::Freed
                         } else {
@@ -656,7 +653,7 @@ fn make_spare(dir: &Path, size: u64) -> io::Result<Spare> {
         Err(e) => {
             // Its blocks go back even while another descriptor of the file is open: a roll that ran out of space
             // meanwhile tries again as soon as this preparation has ended (ADR 0049).
-            crate::journal::discard_unpublished(&file, &path);
+            let _ = crate::journal::discard_unpublished(&file, &path);
             Err(e)
         }
     }

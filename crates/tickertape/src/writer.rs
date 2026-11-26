@@ -1572,6 +1572,7 @@ fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segmen
         // Map before publishing, so that nothing fallible is left after the link (the publication point).
         let len = usize::try_from(size)
             .map_err(|_| Error::io("map segment", &tmp, io::Error::other("segment too large")))?;
+        crate::fault::hook(crate::fault::Point::MapSegment);
         let map = crate::fault::inject(crate::fault::Point::MapSegment)
             .and_then(|()| MapRw::new(&file, len))
             .map_err(|e| Error::io("map segment", &tmp, e))?;
@@ -1584,7 +1585,7 @@ fn create_segment(dir: &Path, base: u64, size: u64, sync: bool) -> Result<Segmen
         Ok(map) => map,
         Err(e) => {
             // A partial preallocation keeps its blocks on some filesystems (ext4): they go back before a retry.
-            journal::discard_unpublished(&file, &tmp);
+            let _ = journal::discard_unpublished(&file, &tmp);
             return Err(e);
         }
     };
