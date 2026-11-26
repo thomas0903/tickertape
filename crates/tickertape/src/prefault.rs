@@ -779,7 +779,16 @@ mod tests {
         let (_d2, two, weak_two) = released(1 << 16);
         assert!(prefaulter.switch(map.advice(), 64, Some(two)).is_none());
         wait_closed(&weak_two);
-        assert_eq!(prefaulter.releases_waiting(), 0);
+        // The helper counts a segment as waiting until it has dropped it and taken its lock again, a moment after
+        // the file is closed: wait for the count, do not read it once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while prefaulter.releases_waiting() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper still counts a released segment as waiting"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
 
         // A helper that has ended takes nothing: the caller drops the segment itself.
         lock(&prefaulter.shared).ended = true;
