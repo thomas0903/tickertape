@@ -127,12 +127,14 @@ segments):
 - **Linux, spare segment on:** **1**, the spare being prepared or ready. On macOS a roll waits for the spare and makes
   it its new segment, so the spare adds nothing to the roll's.
 
-The most is reached only while a background checkpoint runs, another waits behind it, and each covers at least five
-segments. A writer whose background checkpoints keep up holds far fewer: 8 in the `tt-scale` runs above, counting the
-process's own 3, and 12 while it opened a journal without a marker. A retention run on the checkpoint thread runs
-between checkpoints and opens a few files at a time, fewer than the checkpoint's list. Your process's own descriptors
-(standard input, output and error) and your readers come on top. `tests/open_segments.rs` drives a writer into that
-state with hold points and checks the number exactly, on both platforms.
+The most is reached only while a background checkpoint runs, another waits behind it, each covers five segments or
+more, and the writer has rolled four times since the last request. Otherwise a writer holds far fewer: in the
+`tt-scale` runs above, 8 counting the process's own 3, and 12 while it opened a journal without a marker. A retention
+run on the checkpoint thread runs between checkpoints and opens a few files at a time, fewer than a checkpoint. Your
+process's own descriptors (standard input, output and error) and your readers come on top. The writer maps the same
+segments, except the reopened one and the write-back helper's, plus at most one that the prefault helper may still
+have in hand: address space, not memory. `tests/open_segments.rs` drives a writer into that state with hold points and
+checks the number exactly, on both platforms.
 
 ## Choosing a checkpoint interval
 

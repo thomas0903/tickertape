@@ -111,10 +111,9 @@ fn most_extra_descriptors(spare: &str) -> i64 {
 }
 
 /// Drives the writer with hold points into the state where it holds the most descriptors (the helper's `worst` mode),
-/// checks that it holds exactly [`most_extra_descriptors`] more than after its open there, and the journal's mappings
-/// (Linux: the three lists, the active segment and the new one), then lets it roll [`ROLLS`] times with background
-/// checkpoints every 25 rolls and checks that no sample exceeds either. Machine load changes only which states the free
-/// run passes through, never the bound.
+/// checks that it holds exactly [`most_extra_descriptors`] more than after its open there, and bounds the journal's
+/// mappings (Linux), then lets it roll [`ROLLS`] times with background checkpoints every 25 rolls and checks that no
+/// sample exceeds either. Machine load changes only which states the free run passes through, never the bound.
 fn most_descriptors_under_a_low_limit(spare: &str) {
     let dir = tempfile::tempdir().unwrap();
     let journal = dir.path().join("j");
@@ -137,15 +136,18 @@ fn most_descriptors_under_a_low_limit(spare: &str) {
         "descriptors grew by {most}, more than {bound} (spare: {spare})"
     );
     if cfg!(target_os = "linux") {
-        // The spare is held before it is mapped; a spare that is ready is mapped, but then a roll uses it.
-        let maps = 3 * OPEN_SEGMENTS + 1;
-        assert_eq!(
-            held_maps, maps,
-            "journal mappings in the worst state; open files there:\n{open_files}"
+        // The lists' segments, the active one and a roll's new one are mapped (not the reopened one or the write-back
+        // helper's), plus at most one the prefault helper may still have in hand after every list let go of it (it is
+        // not held, so this is a bound, not exact) and a spare once it is ready (the held one is not mapped yet).
+        let maps = 3 * OPEN_SEGMENTS + 2 + i64::from(spare == "on");
+        assert!(
+            held_maps <= maps && most_maps <= maps,
+            "journal mappings grew by {held_maps} in the worst state and {most_maps} at most, more than {maps}; open \
+             files in the worst state:\n{open_files}"
         );
         assert!(
-            most_maps <= maps,
-            "journal mappings grew by {most_maps}, more than {maps}"
+            held_maps > 3 * OPEN_SEGMENTS,
+            "journal mappings in the worst state: {held_maps}"
         );
     }
     assert!(segments(&journal).len() as u64 > ROLLS);

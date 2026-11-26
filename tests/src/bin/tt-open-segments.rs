@@ -9,8 +9,9 @@
 //! - `tt-open-segments worst <dir> <rolls> <request_every> <spare>`: drives the writer, with the hold points of
 //!   `tickertape::fault`, into the state where it holds the most descriptors (`docs/operations.md` → Open files): the
 //!   write-back helper (Linux) held with a segment it was handed, a background checkpoint held with a segment it
-//!   reopened, a second one queued behind it, the writer's own list full, and a spare segment requested (if on). Prints
-//!   the change in descriptors and in mappings of journal files (Linux) from just after the open to that state; then
+//!   reopened, a second one queued behind it, the writer's own list full, a spare being prepared (Linux, if on), and a
+//!   roll in progress. Prints the change in the writer's descriptors and in mappings of journal files (Linux) from just
+//!   after the open to that state; then
 //!   releases the holds, rolls until `rolls` with a background checkpoint requested every `request_every` rolls,
 //!   samples after each roll, checkpoints, and prints the next sequence number and the largest sampled changes. On
 //!   Linux the open descriptors and mappings at the held state go to standard error.
@@ -37,6 +38,23 @@ fn descriptors() -> usize {
 /// Mappings of this process (Linux only; 0 elsewhere).
 fn mappings() -> usize {
     std::fs::read_to_string("/proc/self/maps").map_or(0, |m| m.lines().count())
+}
+
+/// The writer's descriptors: on Linux those that name a file under `dir` (canonical) or the wake-up region, which
+/// leaves out the files a helper thread reads once when it starts (`/sys/devices/system/cpu/isolated`, to place itself);
+/// elsewhere every open descriptor (the helpers read nothing there).
+fn writer_descriptors(dir: &std::path::Path) -> usize {
+    if !cfg!(target_os = "linux") {
+        return descriptors();
+    }
+    std::fs::read_dir("/proc/self/fd").map_or(0, |fds| {
+        fds.flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .filter(|target| {
+                target.starts_with(dir) || target.to_string_lossy().contains("tickertape-notify")
+            })
+            .count()
+    })
 }
 
 /// Mappings of files under `dir` (Linux only; 0 elsewhere): the segments and the spare.
@@ -95,10 +113,15 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
     let linux_spare = cfg!(target_os = "linux") && spare == "on";
     let spare_hold = linux_spare.then(|| fault::hold_background(Point::SpareMap));
     let mut writer = Writer::open(dir, config(spare)).unwrap_or_else(|e| fail("open", e));
-    let (fds0, maps0) = (descriptors() as i64, journal_mappings(dir) as i64);
+    let canonical = std::fs::canonicalize(dir).expect("journal directory");
+    let (fds0, maps0) = (
+        writer_descriptors(&canonical) as i64,
+        journal_mappings(dir) as i64,
+    );
     let change = move |dir: &str| {
+        let canonical = std::fs::canonicalize(dir).expect("journal directory");
         (
-            descriptors() as i64 - fds0,
+            writer_descriptors(&canonical) as i64 - fds0,
             journal_mappings(dir) as i64 - maps0,
         )
     };

@@ -45,7 +45,13 @@ candidate for the final barrier) until the next one was open.
   has reopened a released segment) and `fault::Point::EarlyWriteback` (the write-back helper with a segment in hand),
   with the existing `SpareMap` and `RollAfterLink`, drive a writer into the state where it holds the most:
   `tt-open-segments worst`. The tests check that it holds exactly the stated number there, then let it roll 300 times
-  with background checkpoints and check that no sample exceeds it. Both descriptor tests run again by default.
+  with background checkpoints and check that no sample exceeds it. Both descriptor tests run again by default. On
+  Linux they count the writer's own files (under the journal directory, and the wake-up region): each helper thread
+  reads `/sys/devices/system/cpu/isolated` once when it starts, to place itself, which made a count taken just after
+  the open one too high under load. That file is open only while a helper starts (at the open, and at the first
+  request for the checkpoint thread), when the lists are short, so it does not raise the bound. The journal's mappings
+  are bounded, not counted exactly: the prefault helper can still hold the mapping of a segment that every list has
+  released, and it has no hold point.
 
 ## Consequences
 
