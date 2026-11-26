@@ -152,20 +152,19 @@ The filesystem and storage determine what sync costs; this is not a power-loss t
 cargo build -p tickertape-bench --release --bin tt-faults
 target/release/tt-faults --dir /tmp/tt-pf --rate 100000 --payload 1024 --seconds 20 --warmup-seconds 3 \
   --checkpoint-ms 1000 --writer-cpu 1 --reader-cpu 2 --helper-cpus 3 --log /tmp/appends.txt
-# with the experiment switches of ADR 0058 (never in a default build):
-RUSTFLAGS="--cfg tickertape_pf_exp" CARGO_TARGET_DIR=target/pf-exp cargo build -p tickertape-bench --release --bin tt-faults
 sudo bpftrace benches/diagnostics/writer-faults.bt 1 > trace.txt   # before the run; SIGINT after it
 ```
 
-Paced appends on the main thread, timed from the scheduled send as in `tt-latency`, with a background checkpoint at
-the interval given and, with `--reader-cpu`, a zero-copy reader that busy-polls. The writer thread's minor and major
-fault counts (`getrusage(RUSAGE_THREAD)`) are read before each wait and after each append, so every append is counted
-as faulted or not; the JSON result has the latency of both kinds, faults per append and per MiB, and `--log` writes
-each faulted or slow append with its segment offset. `writer-faults.bt` classifies each fault of the thread as not
-present or write-protected (on xfs, uncomment its `xfs_trans_alloc` probe) and times the write-back calls of the helper
-and checkpoint threads. The switches it was used with are listed in
-`crates/tickertape/src/prefault.rs` (`exp`) and `checkpoint.rs` (`TT_PF_RANGED`); results are in
-`docs/benchmarks.md` (2026-11-26, the writer's remaining page faults with prefaulting on).
+Paced appends on the main thread, timed from the scheduled send as in `tt-latency`, with a background checkpoint at the
+interval given and, with `--reader-cpu`, a zero-copy reader that busy-polls. The writer thread's minor and major fault
+counts (`getrusage(RUSAGE_THREAD)`) are read before each wait and after each append, so every append is counted as
+faulted or not; the JSON result has the latency of both kinds, faults per append and per MiB, and `--log` writes each
+faulted or slow append with its segment offset. `writer-faults.bt` classifies each fault of the thread as not present or
+write-protected (on xfs, uncomment its `xfs_trans_alloc` probe) and times the write-back calls of the helper and
+checkpoint threads. It measures the library as built. The experiment switches it was run with for ADR 0058 (prefault
+window, re-touch, early write-back lag and alignment, the ranged sync, a writer-thread touch) are not in `main`: they
+are on the branch `exp/prefault-residual` (never merged), which `docs/benchmarks.md` (2026-11-26, the writer's remaining
+page faults with prefaulting on) describes.
 
 ## Replay and recovery at scale (`tt-scale`)
 

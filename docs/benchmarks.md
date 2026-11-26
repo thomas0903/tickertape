@@ -692,15 +692,19 @@ lazy_itable_init=0,lazy_journal_init=0`, 1 GiB journal), then xfs with defaults,
 `none`; `write_cache` "write through" on every disk of both VMs. Write-back sysctls at their defaults. Results on the
 boot disk.
 
-Source: `main` at `42b2307e` plus the experiment switches of this branch (`tt-faults`, `writer-faults.bt`, and library
-switches compiled only with `--cfg tickertape_pf_exp` or `--cfg tickertape_pf_touch_append`), sent to the VMs as a
-source archive; the aarch64 VM and the x86-64 supplement had the two switches added last (`TT_PF_WB_ALIGN_KIB`,
-`TT_PF_RANGED`). The default configuration ran a build without either `--cfg` (there the switches are not compiled).
-Binaries' sha256 (x86-64): `tt-faults` `79f769e9…` (default), `559b4974…` (switches), `6cfe3337…` (switches, with the
-last two), `f80156ad…` (touch in `append`); aarch64: `e4e36bca…` (default), `3c83f66b…` (switches, all of them),
-`7a309a14…` (touch in `append`).
+Source: the branch `exp/prefault-residual` (never merged; ADR 0058 → "Where the experiment code is" has the build
+commands). The library switches are not in `main`; there they are compiled only with `--cfg tickertape_pf_exp`, or with
+`--cfg tickertape_pf_exp --cfg tickertape_pf_touch_append` for the touch in `append`. The x86-64 matrix was built from
+commit `8e691d3b` (`42b2307e` plus the switches), the aarch64 VMs, the x86-64 supplement, the W2 check and the steady-90
+byte counts from `7acd8f86` (two switches more: `TT_PF_WB_ALIGN_KIB`, `TT_PF_RANGED`), each sent to the VMs as a source
+archive whose `git diff 42b2307e` hash was recorded there. The default configuration ran a build without either `--cfg`,
+which compiles none of the switches. The `tt-faults` in `main` is the same tool without its `--touch idle` option, which
+needs one of the switches. Binaries' sha256 (x86-64): `tt-faults` `79f769e9…` (default), `559b4974…` (switches),
+`6cfe3337…` (switches, with the last two), `f80156ad…` (touch in `append`); aarch64: `e4e36bca…` (default), `3c83f66b…`
+(switches, all of them), `7a309a14…` (touch in `append`).
 
 ```sh
+# TT_PF_… and --touch need a build of the branch exp/prefault-residual (above); the rest runs on main.
 [env TT_PF_…] tt-faults --dir … --rate <rate> --payload <64|1024> --seconds 20 --warmup-seconds 3 \
   --checkpoint-ms 1000 --writer-cpu <w> --reader-cpu <r> --helper-cpus <h> --log appends.txt \
   [--no-prefault | --no-early-writeback | --spare-segment | --touch idle]
@@ -718,16 +722,17 @@ last two), `f80156ad…` (touch in `append`); aarch64: `e4e36bca…` (default), 
   (about 90 % of it, near what the device sustains). 128 MiB segments: 13–45 rolls per run.
 - **Configurations.** The default (prefault on, early write-back on, no spare), twice per round as the noise floor
   ("default" in the tables pools both). `prefault(false)`; `early_writeback(false)`; `spare_segment(true)`. Switches
-  (`--cfg tickertape_pf_exp`): `TT_PF_WINDOW_KIB` (window of 1, 4 or 16 MiB); `TT_PF_RETOUCH` (re-touch: at every
-  wake-up the helper prefaults again from the writer's page, so pages written back ahead of the writer are made writable
-  again); `TT_PF_WB_LAG_KIB` and `TT_PF_WB_ALIGN_KIB` (early write-back stops that far behind the writer, rounded down
-  to that alignment: "2–4 MiB behind" is 2,048 KiB rounded to 2 MiB, "to the 128 KiB boundary" is 1 KiB rounded to 128
-  KiB, so that it never reaches the 128 KiB block the writer is in); `TT_PF_RANGED` (ranged sync: the active segment is
-  synced by its ranged `msync` alone, without the whole-file `fdatasync` and the barrier, as PR #102's `TT_EXP_RANGED`);
-  `Writer::exp_touch` called once per wait (writer touch while waiting: an atomic `fetch_or(0)` on the commit word slot
-  at the write position and on the first word of the next page, so what a `Writer::idle()` could do). `--cfg
-  tickertape_pf_touch_append`: the writer, when it enters a new page, touches the next one at the end of `append`
-  (writer touch in `append`, as `microTouch()` but without waiting).
+  (branch `exp/prefault-residual`, `--cfg tickertape_pf_exp`): `TT_PF_WINDOW_KIB` (window of 1, 4 or 16 MiB);
+  `TT_PF_RETOUCH` (re-touch: at every wake-up the helper prefaults again from the writer's page, so pages written back
+  ahead of the writer are made writable again); `TT_PF_WB_LAG_KIB` and `TT_PF_WB_ALIGN_KIB` (early write-back stops that
+  far behind the writer, rounded down to that alignment: "2–4 MiB behind" is 2,048 KiB rounded to 2 MiB, "to the 128 KiB
+  boundary" is 1 KiB rounded to 128 KiB, so that it never reaches the 128 KiB block the writer is in); `TT_PF_RANGED`
+  (ranged sync: the active segment is synced by its ranged `msync` alone, without the whole-file `fdatasync` and the
+  barrier, as PR #102's `TT_EXP_RANGED`); `Writer::exp_touch` called once per wait (writer touch while waiting: an
+  atomic `fetch_or(0)` on the commit word slot at the write position and on the first word of the next page, so what a
+  `Writer::idle()` could do; `tt-faults --touch idle` on the branch). `--cfg tickertape_pf_touch_append`, also on the
+  branch: the writer, when it enters a new page, touches the next one at the end of `append` (writer touch in `append`,
+  as `microTouch()` but without waiting).
 - **Rounds.** Configurations and cells rotated from round to round; every journal deleted and `sync`ed before the next
   run. x86-64: three rounds on ext4 and two on xfs, the last of each traced; the latency tables use the untraced rounds
   only. A supplement on x86-64 ext4 ran six configurations three times, untraced. aarch64: three rounds on ext4 and two
@@ -1209,15 +1214,16 @@ the 128 KiB boundary, the 1,024 B p99.9 falls below Chronicle Queue's with `micr
 
 ### What writes the extra bytes at steady-90 (PR #105's question)
 
-PR #105 found the device writing 7 % more than tickertape appended at steady-90 (1,024 B, aarch64) with the defaults,
-and exactly the appended bytes with early write-back off, and the stalls of 50–144 ms gone with it. The same command
-(`tt-sustained run … --payload 1024 --duration 60s --warmup 10s --cpus 1,2,3,4,5,6 --checkpoint-every 1s
---checkpoint-mode background --retain-bytes 4294967296 --readers mapped,safe:wait=default,safe:durable:wait=block --rate
-304571`, `fstrim` and 3 s before each run), on a new `c4a-standard-8-lssd` (us-east1-b, 13:14–13:45), ext4 on the first
-local SSD, four interleaved runs per configuration, the last under `bytes.bt` (block `bio_queue` bytes by the thread
-that queued them, and folios starting write-back). Device bytes from `/proc/diskstats` (sectors written) over the whole
-run, warm-up included; appended bytes are the records sent × 1,064. "Seconds" counts the 71 seconds of each run, warm-up
-included.
+PR #105 ([2026-11-26, how much of the limit is the
+disk](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms)) found the
+device writing 7 % more than tickertape appended at steady-90 (1,024 B, aarch64) with the defaults, and exactly the
+appended bytes with early write-back off, and the stalls of 50–144 ms gone with it. The same command (`tt-sustained run
+… --payload 1024 --duration 60s --warmup 10s --cpus 1,2,3,4,5,6 --checkpoint-every 1s --checkpoint-mode background
+--retain-bytes 4294967296 --readers mapped,safe:wait=default,safe:durable:wait=block --rate 304571`, `fstrim` and 3 s
+before each run), on a new `c4a-standard-8-lssd` (us-east1-b, 13:14–13:45), ext4 on the first local SSD, four
+interleaved runs per configuration, the last under `bytes.bt` (block `bio_queue` bytes by the thread that queued them,
+and folios starting write-back). Device bytes from `/proc/diskstats` (sectors written) over the whole run, warm-up
+included; appended bytes are the records sent × 1,064. "Seconds" counts the 71 seconds of each run, warm-up included.
 
 | Configuration | Runs | Device GB per run | Device / appended | Append p99.9 (µs) | p99.99 (µs) | max (ms) | Seconds with an append ≥ 10 ms | Durable p50 (ms) | Durable max (ms) | Late sends (%) | Mapped reader p99.9 (ms) |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -4915,7 +4921,9 @@ after each (`ENGINE=sync BS=4k SYNC=1`, 20 s), the latency of an ext4 commit on 
   On a second aarch64 VM tickertape with its defaults made the device write **7 % more bytes** than it appended (24.4
   GB against 22.7 GB per run; with early write-back off exactly the appended bytes; fio with the same pattern wrote only
   its data). At steady-90 that is about 348 MB/s for a device that takes 351. What writes the extra bytes was not
-  traced; it is the first thing to look at (below).
+  traced here; it is the first thing to look at (below). (Traced since, in [2026-11-26, the writer's remaining page faults → What writes the extra bytes](#what-writes-the-extra-bytes-at-steady-90-pr-105s-question): early write-back writes back
+  the 128 KiB folio the writer is still filling, and it is written again once full; stopping early write-back at the
+  128 KiB boundary below the writer removed the extra bytes and these stalls in an experiment.)
 
 ### The device by itself (fio)
 
@@ -5135,7 +5143,7 @@ unwritten pages add to a checkpoint", above); that section also found more devic
 
 Ranked by what it would tell against what it costs (cloud prices of this session):
 
-1. **Find the extra 7 % of device writes** (`blktrace` or a `block_rq_issue` probe by sector and file offset, default
+1. **Find the extra 7 % of device writes** (done: [2026-11-26, the writer's remaining page faults → What writes the extra bytes](#what-writes-the-extra-bytes-at-steady-90-pr-105s-question)) (`blktrace` or a `block_rq_issue` probe by sector and file offset, default
    against early write-back off, on aarch64 and x86-64, steady-90 and steady-50): whether pages are written twice and
    why (ext4's conversion of unwritten extents, the journal; the prefaulted window that every checkpoint writes as
    zeros is only about 268 KiB a second, 2026-11-26 "what prefaulted, unwritten pages add to a checkpoint", above, which

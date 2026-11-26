@@ -20,63 +20,6 @@ pub(crate) const WINDOW: u64 = if cfg!(target_vendor = "apple") {
 } else {
     256 << 10
 };
-/// The window the helper keeps prefaulted: [`WINDOW`], or with `--cfg tickertape_pf_exp` the experiment's
-/// (`TT_PF_WINDOW_KIB`, ADR 0058; never in a default build).
-#[inline]
-fn window() -> u64 {
-    #[cfg(tickertape_pf_exp)]
-    return exp::window();
-    #[cfg(not(tickertape_pf_exp))]
-    WINDOW
-}
-
-/// EXPERIMENT (ADR 0058, compiled only with `--cfg tickertape_pf_exp`; no default build has it): switches read once
-/// from the environment.
-/// - `TT_PF_WINDOW_KIB`: the prefault window in KiB instead of [`WINDOW`].
-/// - `TT_PF_RETOUCH`: at each wake-up the helper prefaults again from the writer's page, so that pages a write-back
-///   cleaned (and write-protected) ahead of the writer are made writable again before the writer reaches them.
-/// - `TT_PF_WB_LAG_KIB`: early write-back stops this far behind the writer, rounded down to `TT_PF_WB_ALIGN_KIB`
-///   (default 2 MiB, the largest folio of the page cache with 4 KiB pages), so that it never writes back the folio
-///   that holds the writer's position.
-#[cfg(tickertape_pf_exp)]
-pub(crate) mod exp {
-    use std::sync::OnceLock;
-
-    fn kib(name: &str) -> Option<u64> {
-        std::env::var(name)
-            .ok()?
-            .parse::<u64>()
-            .ok()
-            .map(|k| k << 10)
-    }
-
-    pub(crate) fn window() -> u64 {
-        static W: OnceLock<u64> = OnceLock::new();
-        *W.get_or_init(|| kib("TT_PF_WINDOW_KIB").unwrap_or(super::WINDOW))
-    }
-
-    pub(crate) fn retouch() -> bool {
-        static R: OnceLock<bool> = OnceLock::new();
-        *R.get_or_init(|| std::env::var_os("TT_PF_RETOUCH").is_some())
-    }
-
-    /// The end of the range early write-back may start for a writer at `position`: with `TT_PF_WB_LAG_KIB` set,
-    /// `position` less the lag, rounded down to `TT_PF_WB_ALIGN_KIB` (default 2 MiB).
-    pub(crate) fn writeback_limit(position: u64, page: u64) -> u64 {
-        static L: OnceLock<(u64, u64)> = OnceLock::new();
-        let (lag, align) = *L.get_or_init(|| {
-            (
-                kib("TT_PF_WB_LAG_KIB").unwrap_or(0),
-                kib("TT_PF_WB_ALIGN_KIB").unwrap_or(2 << 20).max(4096),
-            )
-        });
-        match lag {
-            0 => position / page * page,
-            lag => position.saturating_sub(lag) / align * align,
-        }
-    }
-}
-
 /// How far the write position moves between wake-ups of the helper.
 const STEP: u64 = if cfg!(target_vendor = "apple") {
     1 << 20
@@ -115,9 +58,6 @@ struct State {
     /// Prefault up to this offset.
     target: u64,
     stop: bool,
-    /// EXPERIMENT (`TT_PF_RETOUCH`): prefault again from this offset.
-    #[cfg(tickertape_pf_exp)]
-    restart: Option<u64>,
 }
 
 impl Prefaulter {
@@ -128,10 +68,8 @@ impl Prefaulter {
                 advice,
                 epoch: 0,
                 start: offset,
-                target: offset.saturating_add(window()),
+                target: offset.saturating_add(WINDOW),
                 stop: false,
-                #[cfg(tickertape_pf_exp)]
-                restart: None,
             }),
             wake: Condvar::new(),
             #[cfg(test)]
@@ -158,11 +96,7 @@ impl Prefaulter {
         if offset >= self.next_wake {
             self.next_wake = offset.saturating_add(STEP);
             let mut state = lock(&self.shared);
-            state.target = offset.saturating_add(window());
-            #[cfg(tickertape_pf_exp)]
-            if exp::retouch() {
-                state.restart = Some(offset);
-            }
+            state.target = offset.saturating_add(WINDOW);
             drop(state);
             self.shared.wake.notify_one();
         }
@@ -175,11 +109,7 @@ impl Prefaulter {
         state.advice = advice;
         state.epoch = state.epoch.wrapping_add(1);
         state.start = offset;
-        state.target = offset.saturating_add(window());
-        #[cfg(tickertape_pf_exp)]
-        {
-            state.restart = None;
-        }
+        state.target = offset.saturating_add(WINDOW);
         drop(state);
         self.shared.wake.notify_one();
     }
@@ -231,10 +161,6 @@ fn run(shared: &Shared) {
                     epoch = Some(state.epoch);
                     advice = Some(state.advice.clone());
                     done = state.start;
-                }
-                #[cfg(tickertape_pf_exp)]
-                if let Some(from) = state.restart.take() {
-                    done = done.min(from);
                 }
                 let limit = state.target.min(state.advice.len());
                 if done < limit {

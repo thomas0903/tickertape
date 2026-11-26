@@ -1,6 +1,8 @@
 //! Page faults on the writer's thread, append by append (ADR 0058): which appends take a fault, how long they take
 //! against the appends that do not, and where in the segment they are. Linux only (it reads the thread's fault counts
-//! with `getrusage(RUSAGE_THREAD)`).
+//! with `getrusage(RUSAGE_THREAD)`). It measures what the library does as built; the experiment variants of ADR 0058
+//! (library switches, and a `--touch idle` option that calls a writer-thread touch) are on the branch
+//! `exp/prefault-residual`, which is never merged.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -21,15 +23,14 @@ const HELP: &str = "tt-faults: page faults on the writer's thread, append by app
 Usage: tt-faults --dir <DIR> --rate <records/s> --payload <bytes> --seconds <S> [--warmup-seconds <S>]
                  [--checkpoint-ms <MS>] [--no-prefault] [--no-early-writeback] [--spare-segment]
                  [--segment-size <bytes>] [--writer-cpu <N>] [--reader-cpu <N>] [--helper-cpus <LIST>]
-                 [--touch none|idle] [--log <FILE>] [--slow-us <US>]
+                 [--log <FILE>] [--slow-us <US>]
 
 Paced appends on the main thread (named tt-faults, for tracing), scheduled on the wall clock as tt-latency does; the
 latency of an append runs from its scheduled send to the return of Writer::append. The thread's minor and major fault
 counts are read with getrusage(RUSAGE_THREAD) before the wait for the send and after the append, outside the timed
 part unless the append is late. --checkpoint-ms requests a background checkpoint (Writer::request_checkpoint) at that
 interval. --reader-cpu adds a zero-copy reader on a thread of its own that busy-polls and measures the visible
-latency. --touch idle calls Writer::exp_touch once in each wait (needs --cfg tickertape_pf_exp). --log writes one line
-per measured append that took a fault or more than --slow-us (default 20): its scheduled wall time (ns), latency
+latency. --log writes one line per measured append that took a fault or more than --slow-us (default 20): its scheduled wall time (ns), latency
 (ns), minor and major faults, segment base sequence and offset, and ms since the last checkpoint request. Prints JSON.";
 
 fn hist() -> Result<Histogram<u64>> {
@@ -77,7 +78,6 @@ fn run(args: &[String]) -> Result<()> {
             "--writer-cpu",
             "--reader-cpu",
             "--helper-cpus",
-            "--touch",
             "--log",
             "--slow-us",
         ],
@@ -90,14 +90,6 @@ fn run(args: &[String]) -> Result<()> {
     let warmup = options.number("--warmup-seconds", Some(2))?;
     let checkpoint_ms = options.number("--checkpoint-ms", Some(0))?;
     let slow_ns = options.number("--slow-us", Some(20))? * 1000;
-    let touch = options.optional("--touch").unwrap_or("none").to_owned();
-    if !["none", "idle"].contains(&touch.as_str()) {
-        return Err("--touch must be none or idle".into());
-    }
-    #[cfg(not(tickertape_pf_exp))]
-    if touch != "none" {
-        return Err("--touch idle needs a build with --cfg tickertape_pf_exp".into());
-    }
     let cpu = |key: &str| -> Result<Option<usize>> {
         options
             .optional(key)
@@ -181,8 +173,6 @@ fn run(args: &[String]) -> Result<()> {
     let mut last_checkpoint = t0;
     let (mut late, mut checkpoints) = (0u64, 0u64);
     let (mut minor_total, mut major_total, mut faulted_appends) = (0u64, 0u64, 0u64);
-    #[cfg_attr(not(tickertape_pf_exp), allow(unused_mut))]
-    let (mut idle_minor, mut idle_calls) = (0u64, 0u64);
     let mut by_class = [0u64; 3]; // faulted appends in the first 256 KiB of a segment, within 5 ms of a checkpoint request, elsewhere
     let mut after = faults()?;
     let started = Instant::now();
@@ -192,24 +182,11 @@ fn run(args: &[String]) -> Result<()> {
     for i in 0..total {
         let intended = tickertape_bench::intended_ns(t0, i, rate)?;
         let measured = i >= measured_from_index;
-        #[cfg_attr(not(tickertape_pf_exp), allow(unused_mut))]
-        let mut before = after;
+        let before = after;
         let mut now = clock::realtime_ns();
-        if now < intended {
-            #[cfg(tickertape_pf_exp)]
-            if touch == "idle" {
-                writer.exp_touch();
-                idle_calls += 1;
-                let counted = faults()?;
-                if measured {
-                    idle_minor += counted.0 - before.0;
-                }
-                before = counted;
-            }
-            while now < intended {
-                std::hint::spin_loop();
-                now = clock::realtime_ns();
-            }
+        while now < intended {
+            std::hint::spin_loop();
+            now = clock::realtime_ns();
         }
         if measured && now - intended > 1000 {
             late += 1;
@@ -280,7 +257,7 @@ fn run(args: &[String]) -> Result<()> {
     let mib = (measured * record_bytes) as f64 / f64::from(1 << 20);
     let result = json!({
         "rate": rate, "payload": payload.len(), "seconds": seconds, "warmup_seconds": warmup,
-        "checkpoint_ms": checkpoint_ms, "touch": touch,
+        "checkpoint_ms": checkpoint_ms,
         "elapsed_s": elapsed, "appends_measured": measured, "record_bytes": record_bytes, "mib_measured": mib,
         "final_head": {"segment_base_seq": head.segment_base_seq, "offset": head.offset},
         "checkpoints_requested": checkpoints,
@@ -292,7 +269,6 @@ fn run(args: &[String]) -> Result<()> {
             "faulted_appends_segment_start": by_class[0],
             "faulted_appends_after_checkpoint_5ms": by_class[1],
             "faulted_appends_elsewhere": by_class[2],
-            "idle_touch_calls": idle_calls, "idle_touch_minor": idle_minor,
         },
         "append_latency": histogram_json(&all),
         "append_latency_faulted": histogram_json(&faulted),

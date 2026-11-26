@@ -54,8 +54,9 @@ round (`benches/diagnostics/writer-faults.bt`) classified every fault of the wri
 not mapped) or write-protected (mapped, not writable), what it started (a journal handle, an xfs transaction) and what
 had written the page back before it. Four cells: 64 B at 1,000,000 records/s, and 1,024 B at 100,000, 170,000 and
 300,000 records/s (the last near what the device sustains); runs of 20 s after 3 s of warm-up; configurations
-interleaved; the default twice per round as the noise floor. Experiments ran from switches compiled only with `--cfg
-tickertape_pf_exp` (below); a default build does not contain them. Figures and method are in `docs/benchmarks.md`.
+interleaved; the default twice per round as the noise floor. Experiments ran from switches that are not in `main`: they
+are on the branch `exp/prefault-residual`, never merged ("Where the experiment code is", below). Figures and method are
+in `docs/benchmarks.md`.
 
 1. **Where the faults are** (default configuration, x86-64 ext4; xfs the same; aarch64 below). Faults on the writer's
    thread per MiB written: 8.1–8.4 at 64 B, 9.3–9.6 at 1,024 B × 100,000/s, 2.0–2.2 at 170,000/s, 0.55–0.62 at 300,000/s
@@ -215,10 +216,11 @@ commit is per range would not be, and neither of the two read here is.
 
 ## Decision
 
-Proposed: options 4 and 5, each first as a change of its own, off by default (a private switch in a benchmark build, as
-now), and on by default only after the measurements below. Neither touches the format, the API or the guarantees. They
-are one story: both stop the library from writing back pages the writer has not finished (option 4 the rest of the folio
-it is filling, option 5 the prefaulted window), which costs device bytes and, through write-protection, the writer's
+Proposed: options 4 and 5, each as a change of its own in a pull request of its own, built from the branch below and on
+by default only after the measurements below. Option 4 is to be built and measured next; option 5 stays proposed until a
+drive with a real volatile write cache has been tested. Neither touches the format, the API or the guarantees. They are
+one story: both stop the library from writing back pages the writer has not finished (option 4 the rest of the folio it
+is filling, option 5 the prefaulted window), which costs device bytes and, through write-protection, the writer's
 faults. Option 4 is the one with the large effect (latency, the extra bytes, the aarch64 stalls at steady-90); option 5
 saves the window's write at every checkpoint and changes the crash contract's wording, so it needs the volatile-cache
 check first. If only one is taken, it should be option 4.
@@ -237,6 +239,31 @@ check first. If only one is taken, it should be option 4.
   kernel the project will state.
 - **Both together** on x86-64 (only aarch64 ran them together).
 
+## Where the experiment code is
+
+The branch `exp/prefault-residual` (never merged; no tag). Each switch is compiled only with `--cfg tickertape_pf_exp`
+(window, re-touch, early write-back lag and alignment, ranged sync, `Writer::exp_touch`) or, for the touch in `append`,
+`--cfg tickertape_pf_exp --cfg tickertape_pf_touch_append`, and read from the environment once (`TT_PF_WINDOW_KIB`,
+`TT_PF_RETOUCH`, `TT_PF_WB_LAG_KIB`, `TT_PF_WB_ALIGN_KIB`, `TT_PF_RANGED`). Its commits:
+
+- `8e691d3b`: the source of the x86-64 matrix (42b2307e plus the switches without `TT_PF_WB_ALIGN_KIB` and
+  `TT_PF_RANGED`; `git diff 42b2307e` of the tracked files hashes to the prefix `1c12916d5cc5` recorded on the VM).
+- `7acd8f86`: with those two added; the source of the aarch64 runs, the x86-64 supplement, the W2 check and the
+  steady-90 byte counts (prefix `b3513c036041`).
+- `942bb7f7`: the same switches on `main` at `8a70d7ba`, renamed to this ADR and formatted, with this ADR's first
+  documents. Option 4's change starts from here.
+
+Each measured build, from the commit named:
+
+```sh
+git checkout <commit>
+cargo build --release --locked -p tickertape-bench --bin tt-faults --bin tt-sustained --bin tt-latency --bin tt-append-cost
+RUSTFLAGS="--cfg tickertape_pf_exp" CARGO_TARGET_DIR=target/exp cargo build --release --locked -p tickertape-bench …
+RUSTFLAGS="--cfg tickertape_pf_exp --cfg tickertape_pf_touch_append" CARGO_TARGET_DIR=target/tapp cargo build …
+```
+
+The default configuration in every table is the first build, which compiles none of the switches.
+
 ## What was not measured
 
 Bare metal; other VM shapes (4 or 16 vCPUs) and other disks; macOS (there the helper advises `MADV_WILLNEED` 8 MiB
@@ -249,8 +276,8 @@ steady-90).
 
 ## Consequences
 
-- `tt-faults` and `benches/diagnostics/writer-faults.bt` stay, for the measurements above. The experiment switches stay
-  behind `--cfg tickertape_pf_exp` and `--cfg tickertape_pf_touch_append`, which no default or release build sets.
+- `tt-faults` and `benches/diagnostics/writer-faults.bt` are in `main`, for the measurements above; `tt-faults` there
+  measures the library as built. The experiment switches are not in `main` and stay on the branch below.
 - If option 4 or 5 is adopted, `docs/operations.md` (writer threads, early write-back) and, for 5, the crash contract
   change as described; the README's sentence on prefaulting at 1,024 bytes is out of date either way
   (`docs/benchmarks.md` has the proposed replacement).
