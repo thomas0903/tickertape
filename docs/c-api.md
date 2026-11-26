@@ -367,7 +367,7 @@ downcalls, with no Java code in between that can block, as the Java binding does
 | `TICKERTAPE_E_IO` | A system call failed (see `tickertape_last_error_os_code`) |
 | `TICKERTAPE_E_STORAGE_FULL` | A system call failed with `ENOSPC` or `EDQUOT`; a failed append can be retried later (never used for an append refused after a failed clean-up) |
 | `TICKERTAPE_E_LOCKED` | Another writer has the journal open |
-| `TICKERTAPE_E_CORRUPT` | Journal bytes failed validation; a reader's cursor does not move |
+| `TICKERTAPE_E_CORRUPT` | Journal bytes failed validation, or (from 1.1) a reader is at an empty slot that the checkpoint marker or a later segment shows to have been filled; a reader's cursor does not move |
 | `TICKERTAPE_E_UNSUPPORTED_VERSION` | A segment has an unsupported format version |
 | `TICKERTAPE_E_NOT_FOUND` | The directory exists but has no segments yet (a missing directory is `TICKERTAPE_E_IO` with `ENOENT`) |
 | `TICKERTAPE_E_SEQ_UNAVAILABLE` | The sequence number is older than the oldest segment |

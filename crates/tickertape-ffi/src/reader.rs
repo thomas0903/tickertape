@@ -396,10 +396,11 @@ pub unsafe extern "C" fn tickertape_reader_seek_to_end(
 /// `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed. It is NULL when
 /// `payload_len` is 0.
 ///
-/// Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
-/// again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer
-/// recovery or retention replaced or removed the segment at the cursor (call `tickertape_reader_seek`);
-/// `TICKERTAPE_E_IO`; or an error deferred by `tickertape_reader_read_batch`.
+/// Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation, or (from 1.1) if the slot there is empty
+/// although the checkpoint marker or a later segment shows that it was filled
+/// (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`; the cursor does not move in either case, so calling again retries the same
+/// position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer recovery or retention
+/// replaced or removed the segment at the cursor (call `tickertape_reader_seek`); `TICKERTAPE_E_IO`; or an error deferred by `tickertape_reader_read_batch`.
 ///
 /// # Safety
 ///

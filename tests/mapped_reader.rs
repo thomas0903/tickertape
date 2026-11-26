@@ -269,20 +269,23 @@ fn rewrite_with_valid_crc(path: &Path, placed: Placed, edit: impl FnOnce(&mut [u
 enum Expect {
     /// Every record before `seq`, then the given reason at the record's offset.
     Corrupt(u64, fn(&CorruptReason) -> bool),
-    /// Every record before `seq`, then an empty slot.
+    /// Every record before `seq`, then an empty slot: reported as corruption if there are later segments (ADR 0050).
     EndAt(u64),
     /// Every record, unchanged.
     Unchanged,
 }
 
-fn check_expect(trace: &Trace, expect: Expect, total: usize, case: &str) {
+fn check_expect(trace: &Trace, expect: Expect, total: usize, newest: bool, case: &str) {
     match expect {
         Expect::Unchanged => {
             assert_eq!(trace.end, None, "{case}");
             assert_eq!(trace.records.len(), total, "{case}");
         }
         Expect::EndAt(seq) => {
-            assert_eq!(trace.end, None, "{case}");
+            match &trace.end {
+                Some(end) => assert!(end.contains("EmptyCommitWord") && !newest, "{case}: {end}"),
+                None => assert!(newest, "{case}"),
+            }
             assert_eq!(trace.records.len() as u64, seq, "{case}");
         }
         Expect::Corrupt(seq, _) => {
@@ -561,7 +564,8 @@ fn every_corruption_class_is_reported_identically() {
         let file = dir.join(path.file_name().unwrap());
         corrupt(&file, placed);
         let trace = both(&dir);
-        check_expect(&trace, expect, total, name);
+        let newest = path == &segs[segs.len() - 1].1;
+        check_expect(&trace, expect, total, newest, name);
         // The marker bounds the zero-copy reader's loads (ADR 0048) and changes no result: one right before the target,
         // one right after it, one inside it, and one in the last segment.
         let base_seq = format::parse_segment_file_name(path.file_name().unwrap().to_str().unwrap());
@@ -577,7 +581,8 @@ fn every_corruption_class_is_reported_identically() {
         ] {
             let slot = format::encode_checkpoint_slot(&format::CheckpointSlot {
                 generation: 1,
-                next_seq: u64::MAX,
+                // No evidence about an empty slot that the last segment is not too (ADR 0050).
+                next_seq: segs[segs.len() - 1].0,
                 segment_base_seq,
                 offset,
             });

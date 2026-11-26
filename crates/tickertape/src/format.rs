@@ -2513,7 +2513,10 @@ mod tests {
         let mut crafted = image.clone();
         assert_eq!(append(&mut crafted, start, &record(12), &payload), end);
         let (spent, budget) = (24 * fakes * fakes / 2, 2 * (end - 64));
-        assert!(spent > budget, "the fakes exceed the CRC32C bound ({spent} > {budget})");
+        assert!(
+            spent > budget,
+            "the fakes exceed the CRC32C bound ({spent} > {budget})"
+        );
         assert!(record_ends_at(&crafted[..], 7, end as u64, 13));
         assert!(!record_ends_at(&crafted[..], 7, end as u64, 14));
         // The fallback walk validates every record before the position: here it stops at a damaged one.

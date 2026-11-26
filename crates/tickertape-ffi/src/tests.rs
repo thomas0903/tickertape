@@ -1054,6 +1054,78 @@ fn batch_errors_after_records_are_deferred_to_the_next_call() {
     );
 }
 
+/// A zeroed commit word that the checkpoint covers (ADR 0050): the corruption status with its reason from every read call,
+/// after the records before it, in both kinds of reader, with a timeout and without.
+#[test]
+fn an_emptied_commit_word_is_corrupt_not_none() {
+    let j = Journal::new();
+    let writer = j.writer(65_536);
+    let payload = [7u8; 8];
+    for _ in 0..5 {
+        let status =
+            unsafe { tickertape_writer_append(writer, 1, 0, 0, payload.as_ptr(), 8, null_mut()) };
+        assert_eq!(status, OK);
+    }
+    assert_eq!(unsafe { tickertape_writer_checkpoint(writer) }, OK);
+    assert_eq!(unsafe { tickertape_writer_close(writer) }, OK);
+    let segment = j.dir.join(format!("{:020}.tape", 0));
+    let mut bytes = std::fs::read(&segment).unwrap();
+    bytes[64 + 48 * 3..][..4].fill(0);
+    std::fs::write(&segment, bytes).unwrap();
+
+    let corrupt = code(tickertape_status_code::TICKERTAPE_E_CORRUPT);
+    let expect = |status| {
+        assert_eq!(status, corrupt);
+        assert_eq!(
+            tickertape_last_error_corrupt_reason(),
+            tickertape_corrupt_reason::TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD as i32
+        );
+    };
+    for (mapped, durable) in [(false, false), (true, false), (false, true), (true, true)] {
+        let reader = j.reader(durable, mapped);
+        let mut record = empty_record();
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { tickertape_reader_next(reader, 0, &mut record) },
+                OK
+            );
+        }
+        for timeout in [0, 50_000_000] {
+            expect(unsafe { tickertape_reader_next(reader, timeout, &mut record) });
+        }
+        assert_eq!(unsafe { tickertape_reader_seek(reader, 0) }, OK);
+        let mut records = vec![empty_record(); 10];
+        let mut buf = vec![0u8; 1024];
+        for want in [3, 0] {
+            let mut count = 9;
+            let status = unsafe {
+                tickertape_reader_read_batch(
+                    reader,
+                    0,
+                    records.as_mut_ptr(),
+                    records.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut count,
+                )
+            };
+            assert_eq!(count, want);
+            if want == 0 {
+                expect(status);
+            } else {
+                assert_eq!(status, OK);
+            }
+        }
+        let mut position = 0;
+        assert_eq!(
+            unsafe { tickertape_reader_position(reader, &mut position) },
+            OK
+        );
+        assert_eq!(position, 3);
+        assert_eq!(unsafe { tickertape_reader_close(reader) }, OK);
+    }
+}
+
 struct FillState {
     writer: *mut tickertape_writer,
     abort: bool,

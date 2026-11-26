@@ -4,8 +4,9 @@ Status: **accepted** (M1, approved by the owner on 2026-10-31). This document is
 must match it. Rationale: ADRs [0002](decisions/0002-record-format.md) (record format),
 [0003](decisions/0003-publication-protocol.md) (publication and memory access),
 [0005](decisions/0005-segment-rolling.md) (segments and rolling),
-[0007](decisions/0007-checkpoint-marker-and-recovery.md) (checkpoint marker and recovery) and
-[0035](decisions/0035-recovery-preserves-a-committed-tail.md) (committed records after an empty commit word).
+[0007](decisions/0007-checkpoint-marker-and-recovery.md) (checkpoint marker and recovery),
+[0035](decisions/0035-recovery-preserves-a-committed-tail.md) (committed records after an empty commit word) and
+[0050](decisions/0050-empty-slot-in-history.md) (what a reader makes of an empty commit word).
 
 ## Conventions
 
@@ -159,7 +160,8 @@ offset 65,536 wins. Each slot is checked on its own, so a file too short for one
 slot. If neither slot is valid, or the file is missing, there is no checkpoint. A slot is written only after
 everything it describes is durable (see `crash-contract.md` → What `checkpoint()` does), so recovery can trust the
 journal before it. Readers ignore this file unless `ReaderConfig::durable_only(true)` is enabled (and except that seeks read it to decide
-where to start: ADR [0046](decisions/0046-seeks-that-need-no-index.md), and, with a seek index, which segments a
+where to start: ADR [0046](decisions/0046-seeks-that-need-no-index.md), readers at an empty slot read it to tell whether
+the slot was filled ("Empty slots" below), and, with a seek index, which segments a
 durable-only or mapped reader may use one for: crash contract C15; a visible zero-copy reader also bounds its loads by
 it, ADR [0048](decisions/0048-publication-frontier.md), which changes no record or error it returns): then only records
 with `seq < next_seq` are returned, and a missing or invalid marker covers no records (ADR
@@ -188,6 +190,30 @@ means the body is visible, so the reader reads and validates it. Committed bytes
 A seal is published the same way (`seal_crc` first, then a release store of `0xFFFFFFFF`), and only after the next
 segment file is fully created and in place. This orders *visibility* between processes on the same host. It says
 nothing about when bytes reach the disk; see `crash-contract.md`.
+
+### Empty slots
+
+A commit word of 0 is either the head of the journal (or of what the reader can see of it: a roll in progress) or a
+record or seal whose commit word was emptied. The order of the writer's stores tells them apart (ADR
+[0050](decisions/0050-empty-slot-in-history.md)): a record's commit word, then everything after it; a segment's seal, then
+the first record of its successor, then the link of the segment after that; and all of it before a checkpoint marker
+that covers it. So a slot expecting sequence number `S` in segment `X` **cannot be the head** if, read in this order,
+
+1. the current checkpoint's `next_seq` is above `S`, or it names a segment after `X`; or a segment with a `base_seq` above
+   `S` exists, with a valid header (a writer links the name only after the header is written); or the newest segment has `base_seq` `S`, is not `X`, and holds a valid record in its first slot;
+2. the path of `X` still names the file the reader has open; and
+3. the commit word is still 0, read from the file again.
+
+(A segment named `S` that holds no record says nothing: a writer links it before it stores the seal of `X`, and may die
+in between. The slot must be read again after 1, because the 0 read first may be older than the record.) A reader
+reports such a slot as corruption at its offset, `EmptyCommitWord`, after reading it again for 50 ms and then making sure
+of 1 to 3 once more. It looks at the first empty slot after it was opened or moved by a seek, and then after each 100 ms
+at an empty slot (for a later segment at most once a second). Any other empty slot is "no record yet".
+
+A visible reader that a repair in place has left at an offset that starts no record ("What readers do about repairs") is
+not told that bytes are corrupt: if 1 to 3 hold but the record it passed last is not in the file right before its
+position, it gets `Error::Discarded`. (It knows that it is at a record's start at a segment's first slot, and as far as a
+marker covers its position that was read before it passed the records there: ADR 0046.)
 
 ### Abandoned writes
 
@@ -353,7 +379,8 @@ which recovery keeps, and it reads the rest from the current bytes once a later 
 record boundary of the new history, so it simply reads on. A visible reader may return the removed records it had
 already read or buffered, and then continue at its old position in the new history without `Error::Discarded`. Where
 the records of the two histories line up it reads the new ones; otherwise its position falls inside a record, and it
-waits there (`Ok(None)`) or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its
+waits there (`Ok(None)`), gets `Error::Discarded` once the checkpoint or a later segment shows that its position is not
+the head ("Empty slots"), or reports `Error::Corrupt` for bytes that aren't corrupt, until the application seeks to its
 position. (Damage that also destroyed the marker, or set it back to an older one, can let recovery remove covered
 records in place; a seek to the reader's position or forward in its segment then goes on from there if the new history
 holds, right before it, bytes that form a record with the expected sequence number, also for a durable-only reader. A

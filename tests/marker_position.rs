@@ -168,12 +168,27 @@ fn restored_segments_with_a_newer_marker_are_refused() {
         );
 
         restore_segments_only(dir.path(), backup.path());
-        let segment = dir.path().join(format::segment_file_name(newer.segment_base_seq));
+        let segment = dir
+            .path()
+            .join(format::segment_file_name(newer.segment_base_seq));
         assert_refused(dir.path(), &segment, newer.offset, newer.segment_base_seq);
+        // `verify` names where the restored records end, below what the marker covers (ADR 0050).
+        let report = tickertape::inspect::verify(dir.path()).unwrap();
+        assert_eq!(report.last_seq, Some(backed_up - 1));
+        assert!(
+            report.problems.iter().any(|p| p.path == segment
+                && p.reason == CorruptReason::EmptyCommitWord(backed_up + more)),
+            "{:?}",
+            report.problems
+        );
 
         // Remedy 1: restore the marker that belongs to the segments.
         let one = copy_journal(dir.path());
-        fs::copy(backup.path().join("checkpoint"), one.path().join("checkpoint")).unwrap();
+        fs::copy(
+            backup.path().join("checkpoint"),
+            one.path().join("checkpoint"),
+        )
+        .unwrap();
         for policy in POLICIES {
             let w = opens(one.path(), policy);
             assert_eq!(w.next_seq(), backed_up);
@@ -183,7 +198,11 @@ fn restored_segments_with_a_newer_marker_are_refused() {
 
         // Remedy 2: move the marker aside; the writer validates from the oldest segment.
         let two = copy_journal(dir.path());
-        fs::rename(two.path().join("checkpoint"), two.path().join("checkpoint.newer")).unwrap();
+        fs::rename(
+            two.path().join("checkpoint"),
+            two.path().join("checkpoint.newer"),
+        )
+        .unwrap();
         for policy in POLICIES {
             let w = opens(two.path(), policy);
             assert_eq!(w.next_seq(), backed_up);
@@ -209,7 +228,8 @@ fn damage_to_the_last_covered_record_is_refused() {
     let (path, offset) = locate_record(dir.path(), 599);
     assert_eq!(
         path,
-        dir.path().join(format::segment_file_name(c.segment_base_seq))
+        dir.path()
+            .join(format::segment_file_name(c.segment_base_seq))
     );
 
     type Damage = fn(&Path, u64);
@@ -258,12 +278,18 @@ fn a_marker_disagreeing_with_the_record_before_it_is_refused() {
     append_n(&mut w, 10);
     drop(w);
     let c = marker(dir.path());
-    let seg = dir.path().join(format::segment_file_name(c.segment_base_seq));
+    let seg = dir
+        .path()
+        .join(format::segment_file_name(c.segment_base_seq));
     let (_, inside) = locate_record(dir.path(), 445);
     let cases = [
         ("next_seq one too high", c.offset, c.next_seq + 1),
         ("next_seq one too low", c.offset, c.next_seq - 1),
-        ("offset 64, next_seq above the base", 64, c.segment_base_seq + 1),
+        (
+            "offset 64, next_seq above the base",
+            64,
+            c.segment_base_seq + 1,
+        ),
         ("an offset inside a record", inside + 8, 446),
         ("the start of record 445 with next_seq 450", inside, 450),
     ];
@@ -304,7 +330,10 @@ fn both_slots() {
     w.checkpoint().unwrap();
     drop(w);
     let (older, newer) = (marker(backup.path()), marker(dir.path()));
-    assert_eq!((older.next_seq, newer.next_seq, newer.generation), (100, 200, 2));
+    assert_eq!(
+        (older.next_seq, newer.next_seq, newer.generation),
+        (100, 200, 2)
+    );
 
     // The newer slot torn: the older one is current and consistent with the full journal.
     let torn = copy_journal(dir.path());
@@ -318,7 +347,9 @@ fn both_slots() {
 
     // Segments restored from between the two checkpoints: the newer slot is beyond the records, the older is not.
     restore_segments_only(dir.path(), backup.path());
-    let seg = dir.path().join(format::segment_file_name(newer.segment_base_seq));
+    let seg = dir
+        .path()
+        .join(format::segment_file_name(newer.segment_base_seq));
     assert_refused(dir.path(), &seg, newer.offset, newer.segment_base_seq);
     // With the newer slot torn as well, the older one is current, and the journal opens at the restored end.
     tear_current_slot(dir.path());
@@ -369,7 +400,10 @@ fn markers_around_a_roll_open() {
     w.checkpoint().unwrap();
     drop(w);
     let c = marker(base.path());
-    assert_eq!((c.segment_base_seq, c.offset, c.next_seq), (0, SMALL_SEGMENT - 8, full));
+    assert_eq!(
+        (c.segment_base_seq, c.offset, c.next_seq),
+        (0, SMALL_SEGMENT - 8, full)
+    );
 
     // The writer stopped before the roll.
     let before_roll = copy_journal(base.path());
@@ -398,11 +432,12 @@ fn markers_around_a_roll_open() {
         let copy = copy_journal(unsealed.path());
         let w = opens(copy.path(), policy);
         assert_eq!(w.next_seq(), full + 1);
-        assert!(w
-            .recovery_report()
-            .actions
-            .iter()
-            .any(|a| matches!(a, RecoveryAction::Sealed { .. })));
+        assert!(
+            w.recovery_report()
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::Sealed { .. }))
+        );
     }
 
     // Power loss that kept the seal and lost the successor: recovery creates it again; a checkpoint right after
@@ -413,15 +448,19 @@ fn markers_around_a_roll_open() {
         let copy = copy_journal(lost.path());
         let mut w = opens(copy.path(), policy);
         assert_eq!(w.next_seq(), full);
-        assert!(w
-            .recovery_report()
-            .actions
-            .iter()
-            .any(|a| matches!(a, RecoveryAction::CompletedRoll { .. })));
+        assert!(
+            w.recovery_report()
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::CompletedRoll { .. }))
+        );
         w.checkpoint().unwrap();
         drop(w);
         let at_new = marker(copy.path());
-        assert_eq!((at_new.segment_base_seq, at_new.offset, at_new.next_seq), (full, 64, full));
+        assert_eq!(
+            (at_new.segment_base_seq, at_new.offset, at_new.next_seq),
+            (full, 64, full)
+        );
         for p in POLICIES {
             assert_eq!(opens(copy.path(), p).next_seq(), full);
         }
@@ -503,7 +542,10 @@ fn other_legitimate_states_open() {
     drop(w);
     let c = marker(long.path());
     // Records 0 to 2 in the first segment; the long record 3 rolled into its own segment and ends at its trailer.
-    assert_eq!((c.segment_base_seq, c.offset, c.next_seq), (3, SMALL_SEGMENT - 8, 4));
+    assert_eq!(
+        (c.segment_base_seq, c.offset, c.next_seq),
+        (3, SMALL_SEGMENT - 8, 4)
+    );
     for policy in POLICIES {
         assert_eq!(opens(long.path(), policy).next_seq(), 4);
     }
@@ -566,7 +608,11 @@ fn marker_positions(stride: usize) {
         forge(copy.path(), base, offset, next_seq);
         for policy in POLICIES {
             let w = opens(copy.path(), policy);
-            assert_eq!(w.next_seq(), end, "marker at {base}/{offset} for {next_seq}");
+            assert_eq!(
+                w.next_seq(),
+                end,
+                "marker at {base}/{offset} for {next_seq}"
+            );
             assert_eq!(w.recovery_report().scanned_from_seq, next_seq);
             assert!(w.recovery_report().actions.is_empty());
             opened += 1;
@@ -644,7 +690,8 @@ fn crash_states(stride: usize) {
                     tear_current_slot(copy.path());
                 }
                 states += 1;
-                let what = format!("{state} at {base}/{offset} (seq {seq}), newer slot torn: {torn}");
+                let what =
+                    format!("{state} at {base}/{offset} (seq {seq}), newer slot torn: {torn}");
                 for policy in POLICIES {
                     let run = copy_journal(copy.path());
                     match Writer::open(run.path(), small_config().recovery(policy)) {

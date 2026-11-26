@@ -412,9 +412,9 @@ restored records end. If the backup's marker is lost, see "After a crash" → Re
 - **Do not copy a journal a writer is using as a whole.** The files change during the copy, so it is no snapshot.
   Copying the segments before `checkpoint` is dangerous: the marker can cover records the copied segments lack. If the
   marker names a segment the copy lacks, the writer refuses the copy. If it points into a segment that was copied
-  earlier, `status` can exit with 0, and the writer refuses the copy too (from 1.1, ADR 0056: `DanglingCheckpoint` at
-  that segment and the marker's offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole
-  that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
+  earlier, `status` can exit with 0, `verify` reports `EmptyCommitWord` where the copied records end (from 1.1, ADR
+  0050), and the writer refuses the copy (from 1.1, ADR 0056: `DanglingCheckpoint` at that segment and the marker's
+  offset; 1.0.0 opened it, continued at the marker's sequence number and left a hole that readers cannot pass). A sign of this is a `verify` `last_seq` + 1 lower than the checkpoint's `next seq` in
   `status`. Copying `checkpoint` first avoids that, but the records after the marker may be incomplete,
   `verify` can fail because the next segment is missing, and retention may remove segments during the copy. Stop the
   writer, or use the archive recipe above.
@@ -712,9 +712,24 @@ the writer or retention.
   checkpoint slot decodes). Where a segment's records end at an empty
   commit word, `verify` also searches the rest of that segment: it reads backward from the segment's end to find the
   last non-zero byte, then checks the candidates up to it, and can stop early (`cli.md` → `verify`).
-- Until issue #79 is fixed, a zeroed commit word reads as an empty slot: a reader stops there with `Ok(None)`, also in an
-  older segment and below the checkpoint. `export` and `stats` can then exit 0 with part of the journal. Only `verify`
-  reports it, so run `verify` before trusting a full replay.
+- Readers report damage where they meet it: a record or seal that fails its checks, and (from 1.1) a zeroed commit word
+  that the checkpoint marker or a later segment shows to have been filled, as `EmptyCommitWord`. `export`, `stats`, `tail`
+  and `age` then exit with code 2 (a 1.0.0 reader waits at a zeroed word, and those commands end there with code 0). An
+  application gets the error from its read call, again on every call; no reader gets past it within that segment
+  (`seek` to a later segment's base does). A reader cannot tell a zeroed word from the head where nothing covers it: in
+  the newest segment at or after the marker, or in the last segment of a directory without a marker (crash contract C11).
+  What to do: run `verify`, which names the position and what is behind it. If the position is at or after the
+  checkpoint, opening the writer repairs it or refuses ("After a crash"). If it is before the checkpoint, recovery does
+  not look there, except at the record right before the marker's position, where the writer refuses to open (from 1.1,
+  ADR 0056): restore the segment from a copy. For archives and old segments, run `verify` after moving or restoring
+  them, and after storage errors. `EmptyCommitWord` does not always mean damaged bytes (ADR 0050): it also means that the
+  checkpoint marker is newer than the segments (segments restored from a backup while a newer marker was kept; from 1.1
+  the writer refuses such a journal, ADR 0056: restore the backup's marker with the segments, "Restoring from a
+  backup"); that after a
+  power loss a later segment, or its first page, reached the disk and the records or the seal before it did not (reported
+  until a writer opens the journal and repairs it; a reader started at boot before the writer fails until then); or that a
+  segment with a valid header was copied in from another journal (`verify` names it; remove it). A file named like a
+  segment without a valid header is ignored by readers.
 - A damaged header of the oldest segment makes `Reader::open` fail, and with it every seek of a new reader, although no
   other segment is damaged; retention cannot remove that segment either (it reads its header; by the code, not run).
 - `tickertape inspect <dir>` lists segments, their sequence ranges and fill level, and the checkpoint marker.
@@ -755,8 +770,8 @@ the writer or retention.
   and repeated; either copy can be deleted.
   Readers that had seen discarded records get `Error::Discarded`, except after a repair in place (damage that can't
   be told from a crash, as above, so recovery zeroes the records after the empty commit word in the same file), which
-  visible readers can't notice: they may continue into the new history, wait, or report corruption, until seeked to
-  their position (crash contract C11). Durable-only readers never return records that recovery discarded, unless the
+  visible readers can't notice as such: they may continue into the new history, wait, get `Error::Discarded` later, or
+  report corruption, until seeked to their position (crash contract C11). Durable-only readers never return records that recovery discarded, unless the
   damage also destroyed the checkpoint marker (C13).
 - **What `Fail` still does when it refuses:** it leaves the bytes of the corruption it reports, and everything after
   them in that segment, unchanged, and moves no file, but the open is not read-only. Before scanning it may create

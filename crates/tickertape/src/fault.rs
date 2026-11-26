@@ -108,6 +108,17 @@ pub enum Point {
     /// After a visible zero-copy reader that has reached its bound has read the marker again, before it checks that its
     /// segment is still in place. Arm with [`run_at`], or with [`fail_next`] to make that check fail.
     ReaderLimitIdentity,
+    /// A reader has read an empty slot, before it checks whether that slot can be the head of the journal (ADR 0050), that
+    /// is before it reads the checkpoint marker for it. Arm with [`run_at`].
+    ReaderEmptySlotCheck,
+    /// A reader at an empty slot is about to list the segments. Arm with [`run_at`].
+    ReaderEmptySlotList,
+    /// A reader at an empty slot has found that the journal continues after it (ADR 0050), before it reads the slot again.
+    /// Arm with [`run_at`].
+    ReaderEmptySlot,
+    /// A reader at an empty slot has found that again, after it read the slot again for the validation window and before
+    /// it checks that its segment is still in place and reads the slot for the last time. Arm with [`run_at`].
+    ReaderEmptySlotConfirm,
     /// After inspection (`inspect::list_segments`, `inspect::verify`) lists the segments, before it opens each one.
     /// Arm with [`run_at`].
     InspectOpen,

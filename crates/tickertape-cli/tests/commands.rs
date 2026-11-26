@@ -400,6 +400,84 @@ fn corruption_is_reported_and_export_preserves_prefix() {
     }
 }
 
+/// Issue #79, ADR 0050: a zeroed commit word in older history, and one that only the marker covers. Every command that
+/// reads records says so and exits 2, at once, where it ended with 0 at the records before it.
+#[test]
+fn an_emptied_commit_word_in_history_is_reported() {
+    for newest in [false, true] {
+        let (dir, mut writer) = journal(10);
+        writer.checkpoint().unwrap();
+        drop(writer);
+        // Three records to a segment: record 1 (in the first segment), and record 9, the newest.
+        let (file, at, seq, covered) = if newest {
+            ("00000000000000000009.tape", 64, 9, "sequence 10")
+        } else {
+            ("00000000000000000000.tape", 64 + 20_040, 1, "sequence 10")
+        };
+        let segment = dir.path().join(file);
+        let mut raw = fs::OpenOptions::new().write(true).open(&segment).unwrap();
+        raw.seek(SeekFrom::Start(at)).unwrap();
+        raw.write_all(&[0; 4]).unwrap();
+        let message = format!("at offset {at}: commit word is 0 but committed history follows it");
+        let report = |args: &[&str], records: Option<usize>| {
+            let assertion = command()
+                .args(args)
+                .arg(dir.path())
+                .timeout(Duration::from_secs(60))
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains(file))
+                .stderr(predicate::str::contains(message.as_str()))
+                .stderr(predicate::str::contains(covered))
+                .stderr(predicate::str::contains("journal changed").not());
+            let stdout = &assertion.get_output().stdout;
+            match records {
+                Some(n) => assert_eq!(lines(stdout).len(), n, "{args:?}"),
+                None => assert!(stdout.is_empty(), "{args:?}"),
+            }
+        };
+        let n = Some(seq as usize);
+        for durable in [false, true] {
+            let with = |args: &[&'static str]| {
+                let mut args = args.to_vec();
+                args.extend(durable.then_some("--durable-only"));
+                args
+            };
+            report(&with(&["export", "--format", "jsonl"]), n);
+            report(&with(&["stats"]), None);
+            report(&with(&["stats", "--json"]), None);
+            report(&with(&["tail", "--no-follow", "--format", "json"]), n);
+            report(&with(&["tail", "--format", "json"]), n);
+            let last = if newest { "9" } else { "2" };
+            report(
+                &with(&["tail", "--from", last, "--format", "json"]),
+                Some(0),
+            );
+            // Not past what is selected, and not where nothing is read.
+            let to = if newest { "8" } else { "0" };
+            output(&with(&["stats", "--to", to]), &dir);
+            // These start at the marker, or behind it.
+            output(&with(&["age", "--count", "0"]), &dir);
+            output(&with(&["tail", "--from-end", "--no-follow"]), &dir);
+        }
+        let out = dir.path().with_extension("parquet");
+        let path = out.to_str().unwrap();
+        command()
+            .args(["export", "--format", "parquet", "--output", path])
+            .arg(dir.path())
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(message.as_str()));
+        fs::remove_file(&out).unwrap();
+        command()
+            .arg("verify")
+            .arg(dir.path())
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains(file));
+    }
+}
+
 #[test]
 fn export_round_trip_range_and_file() {
     let (dir, _writer) = journal(10);

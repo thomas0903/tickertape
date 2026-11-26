@@ -219,30 +219,40 @@ pub fn reopen_writer(dir: &Path, config: WriterConfig) -> Writer {
 }
 
 /// The segment holding record `seq` and the record's offset in it.
+///
+/// Panics if the chain from the segment's start does not reach a valid record `seq`.
 pub fn locate_record(dir: &Path, seq: u64) -> (PathBuf, u64) {
+    match find_record(dir, seq) {
+        Ok(found) => found,
+        Err(why) => panic!("{why}"),
+    }
+}
+
+/// As [`locate_record`], for journals a test has damaged: `None` if no segment starts at or below `seq`, or if the
+/// chain from that segment's start does not reach a valid record `seq`.
+pub fn try_locate_record(dir: &Path, seq: u64) -> Option<(PathBuf, u64)> {
+    find_record(dir, seq).ok()
+}
+
+fn find_record(dir: &Path, seq: u64) -> Result<(PathBuf, u64), String> {
     let (base, path) = segments(dir)
         .into_iter()
         .rev()
         .find(|(base, _)| *base <= seq)
-        .expect("a segment at or below seq");
+        .ok_or_else(|| format!("no segment at or below record {seq}"))?;
     let image = std::fs::read(&path).unwrap();
     let (mut offset, mut at) = (format::SEGMENT_HEADER_LEN as u64, base);
     while at < seq {
         match format::read_slot(&image[..], offset, at) {
             Ok(format::Slot::Record { next_offset, .. }) => offset = next_offset,
-            other => panic!("record {at} in {}: {other:?}", path.display()),
+            other => return Err(format!("record {at} in {}: {other:?}", path.display())),
         }
         at += 1;
     }
-    assert!(
-        matches!(
-            format::read_slot(&image[..], offset, seq),
-            Ok(format::Slot::Record { .. })
-        ),
-        "record {seq} in {}",
-        path.display()
-    );
-    (path, offset)
+    match format::read_slot(&image[..], offset, seq) {
+        Ok(format::Slot::Record { .. }) => Ok((path, offset)),
+        other => Err(format!("record {seq} in {}: {other:?}", path.display())),
+    }
 }
 
 /// Makes record `seq` corrupt in the file that a later writer's recovery reads, without touching the file that open

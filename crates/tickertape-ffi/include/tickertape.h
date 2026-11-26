@@ -266,10 +266,11 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
   /**
-   * A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
-   * damage; a torn payload can also cause it: `docs/crash-contract.md` C1, C11; ADR 0035). The error message
-   * names the sequence number the evidence carries: a later valid record's, the next sequence number of a seal
-   * that ends the segment, or the base of a later segment.
+   * A commit word reads 0, and recovery, verify or (from 1.1) a reader found evidence of committed records after it
+   * (usually storage damage; a torn payload can also make recovery and verify report it: `docs/crash-contract.md`
+   * C1, C11; ADRs 0035 and 0050). The error message names the sequence number the evidence carries: a later valid
+   * record's, the next sequence number of a seal that ends the segment, the base of a later segment, or the sequence
+   * number the checkpoint marker covers up to.
    */
   TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD = 14,
   /**
@@ -2011,10 +2012,11 @@ tickertape_status tickertape_reader_seek_to_end(struct tickertape_reader *reader
  * `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed. It is NULL when
  * `payload_len` is 0.
  *
- * Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
- * again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer
- * recovery or retention replaced or removed the segment at the cursor (call `tickertape_reader_seek`);
- * `TICKERTAPE_E_IO`; or an error deferred by `tickertape_reader_read_batch`.
+ * Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation, or (from 1.1) if the slot there is empty
+ * although the checkpoint marker or a later segment shows that it was filled
+ * (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`; the cursor does not move in either case, so calling again retries the same
+ * position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer recovery or retention
+ * replaced or removed the segment at the cursor (call `tickertape_reader_seek`); `TICKERTAPE_E_IO`; or an error deferred by `tickertape_reader_read_batch`.
  *
  * # Safety
  *
