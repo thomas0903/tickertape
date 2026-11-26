@@ -40,18 +40,18 @@ fn mappings() -> usize {
     std::fs::read_to_string("/proc/self/maps").map_or(0, |m| m.lines().count())
 }
 
-/// The writer's descriptors: on Linux those that name a file under `dir` (canonical) or the wake-up region, which
-/// leaves out the files a helper thread reads once when it starts (`/sys/devices/system/cpu/isolated`, to place itself);
-/// elsewhere every open descriptor (the helpers read nothing there).
-fn writer_descriptors(dir: &std::path::Path) -> usize {
+/// Open descriptors of this process, except (Linux) those under `/sys/devices/system/cpu/`: a helper thread reads
+/// `/sys/devices/system/cpu/isolated` once when it starts, to place itself, which may still be open just after the
+/// writer's open. Everything else counts, also a descriptor the writer leaked outside the journal directory.
+fn writer_descriptors() -> usize {
     if !cfg!(target_os = "linux") {
         return descriptors();
     }
     std::fs::read_dir("/proc/self/fd").map_or(0, |fds| {
         fds.flatten()
-            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
-            .filter(|target| {
-                target.starts_with(dir) || target.to_string_lossy().contains("tickertape-notify")
+            .filter(|fd| {
+                !std::fs::read_link(fd.path())
+                    .is_ok_and(|target| target.starts_with("/sys/devices/system/cpu/"))
             })
             .count()
     })
@@ -113,15 +113,10 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
     let linux_spare = cfg!(target_os = "linux") && spare == "on";
     let spare_hold = linux_spare.then(|| fault::hold_background(Point::SpareMap));
     let mut writer = Writer::open(dir, config(spare)).unwrap_or_else(|e| fail("open", e));
-    let canonical = std::fs::canonicalize(dir).expect("journal directory");
-    let (fds0, maps0) = (
-        writer_descriptors(&canonical) as i64,
-        journal_mappings(dir) as i64,
-    );
+    let (fds0, maps0) = (writer_descriptors() as i64, journal_mappings(dir) as i64);
     let change = move |dir: &str| {
-        let canonical = std::fs::canonicalize(dir).expect("journal directory");
         (
-            writer_descriptors(&canonical) as i64 - fds0,
+            writer_descriptors() as i64 - fds0,
             journal_mappings(dir) as i64 - maps0,
         )
     };
@@ -139,7 +134,8 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
         assert!(hold.wait_reached(LONG), "the spare was not requested");
     }
     // A checkpoint whose list holds four segments and has released the older ones, held after it has reopened the
-    // oldest: segments 0 to 5 rolled past and the active segment 6, of which 0 to 2 released.
+    // second oldest (so that a checkpoint keeping the first one open as well would show): segments 0 to 5 rolled past
+    // and the active segment 6, of which 0 to 2 released.
     roll(&mut writer, 5);
     let running = fault::hold_background(Point::CheckpointReopen);
     writer
@@ -149,6 +145,14 @@ fn worst(dir: &str, rolls: u64, every: u64, spare: &str) {
         running.wait_reached(LONG),
         "the checkpoint did not reopen a segment"
     );
+    // A hold is used up when it is reached: arm the next one before letting the first go.
+    let second = fault::hold_background(Point::CheckpointReopen);
+    drop(running);
+    assert!(
+        second.wait_reached(LONG),
+        "the checkpoint did not reopen a second segment"
+    );
+    let running = second;
     // A second checkpoint queued behind it, with four segments of its own (and released ones).
     roll(&mut writer, 6);
     writer

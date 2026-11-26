@@ -28,9 +28,9 @@ draws conclusions from those two.
   file; replay opens each segment it enters. These costs grow with the number of segments, so very small segments in a
   long-lived journal make them add up (ADR 0042). Measured on local SSD (`benchmarks.md`, 2026-11-25):
   journals of 10,000, 20,000 and 100,000 segments open, recover, replay and checkpoint, and no operation held more
-  than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold at most does not depend
-  on the number of segments either (at most 20 files, "Open files" below), so the limit on open files (`ulimit -n`) is
-  not a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
+  than 12 open files at 10 to 20,000 segments (not sampled at 100,000). What a writer can hold is bounded whatever the number
+  of segments (20 files at most in this release, "Open files" below), so the limit on open files (`ulimit -n`) is not
+  a constraint on the number of segments. The directory read is: each seek costs about 3 ms at 10,000 segments, 6 ms at
   20,000 and 29 ms at 100,000, also with a seek index, and so does each retention run (from 1.1, ADR 0051; x86-64, warm: a
   checkpoint with a policy that removes nothing 3 ms, 6 ms and 31 ms, against 0.3 ms without one; up to 1.0 every run
   opened every segment, about ten times as much, and seconds with a cold cache). With `max_bytes` a writer's open also asks for
@@ -112,9 +112,12 @@ throughput with headroom: a small cloud VM stalled for hundreds of milliseconds 
 
 ## Open files
 
-A writer holds at most 18 files open (19 on Linux by default, 20 on Linux with the spare segment), whatever the
-number of segments and however far its background checkpoints fall behind (ADR 0054; ADR 0038 → Bounded open
-segments):
+**What 1.x guarantees:** the number of files a writer holds open is bounded, whatever the number of segments and
+however far its background checkpoints fall behind (ADR 0054; ADR 0038 → Bounded open segments). **The counts of this
+release:** at most 18 files, 19 on Linux by default, 20 on Linux with the spare segment. A later 1.x release that
+raises them says so in its changelog. So set the limit on open files (`ulimit -n`, `LimitNOFILE=` in systemd) with
+headroom above the count for your platform, plus your readers and the rest of your process, and read this section
+again when you upgrade. The files of this release:
 
 - **4 always:** `writer.lock`, the marker `checkpoint`, the wake-up region and the active segment.
 - **Up to 12 sealed segments not yet checkpointed:** the 4 newest of each of three lists, the writer's own (segments
@@ -128,12 +131,14 @@ segments):
   it its new segment, so the spare adds nothing to the roll's.
 
 The most is reached only while a background checkpoint runs, another waits behind it, each covers five segments or
-more, and the writer has rolled four times since the last request. Otherwise a writer holds far fewer: in the
+more, and the writer has rolled five times since the last request (the segment active at the request is shared with
+the waiting checkpoint's list). Otherwise a writer holds far fewer: in the
 `tt-scale` runs above, 8 counting the process's own 3, and 12 while it opened a journal without a marker. A retention
 run on the checkpoint thread runs between checkpoints and opens a few files at a time, fewer than a checkpoint. Your
 process's own descriptors (standard input, output and error) and your readers come on top. The writer maps the same
-segments, except the reopened one and the write-back helper's, plus at most one that the prefault helper may still
-have in hand: address space, not memory. `tests/open_segments.rs` drives a writer into that state with hold points and
+segments, except the write-back helper's and (on Linux) the reopened one, plus at most one that the prefault helper
+may still have in hand; on macOS the checkpoint maps the reopened segment for a moment, to `msync` it. That is address
+space, not memory, and no descriptors. `tests/open_segments.rs` drives a writer into that state with hold points and
 checks the number exactly, on both platforms.
 
 ## Choosing a checkpoint interval
