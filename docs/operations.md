@@ -214,6 +214,16 @@ The same rules apply to the library and CLI, without taking the writer lock:
   it (their headers are read to confirm their sizes).
 - Do not put segment files back into a journal while retention or `archive` runs on it: a run lists the directory once
   and does not notice every file that appears in front of the oldest segment (crash contract C14).
+- An archiver (`archive`, `retention::apply`; not a writer's own retention) takes each segment out of the journal by a
+  rename before it lets it go, and checks that it is still the file it checked and that the marker still names a later
+  segment, so that a writer's recovery in between cannot make it remove the marker's segment (ADR 0055). A deletion, and
+  a cross-filesystem move once its copy is durable, rename the segment to `{base:020}.tape.{pid}.{unix_ns}.removing` in
+  the journal directory and then unlink it. If the archiver is killed in between, that name stays: nothing reads it,
+  and a later `archive` or writer retention run unlinks it once it is an hour old, its process is gone and its segment
+  is older than the checkpoint segment. You can also delete it yourself when its `base_seq` is below the checkpoint
+  segment's (`tickertape status`). If its `base_seq` **is** the checkpoint segment's (the archiver was killed while
+  putting back a segment a recovery had just restarted), the writer refuses to open with a dangling checkpoint: rename
+  the file back to `{base_seq:020}.tape` (for a move by rename, from the destination), and the writer opens.
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
   an atomic no-replace rename. `EXDEV` selects copy, sync the copy, sync the destination directory, remove the
   source, sync the journal directory. Existing files (including symlinks and identical copies) are errors.

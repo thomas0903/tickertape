@@ -164,7 +164,10 @@ have a version of their own, can be deleted at any time, and are ignored by 1.0.
 (`tests/compat/v1.0.0-ignores-seek-index.sh`; the one exception is that 1.0.0's `export --output` fails with exit 1, and
 must be run again, if it cannot list `seek-index/` or the directory vanishes while it runs). A 1.0.0 writer does not
 remove indexes before it repairs a journal: readers that use them then rely on the checks by value alone (crash contract
-C15).
+C15). The temporary name an archiver gives a segment it removes (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055),
+which a crash can leave in the journal directory, is ignored by 1.0.0's readers, writer, recovery, `verify`, `status`
+and `archive` (`tests/compat/v1.0.0-ignores-removing.sh`), as by the current ones; only a current retention run unlinks
+it.
 
 **Upgrading and downgrading.**
 

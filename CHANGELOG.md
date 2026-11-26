@@ -5,6 +5,17 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Fixed: an archiver (`retention::apply`, `tickertape archive`) could remove the checkpoint marker's segment, leaving a
+  dangling marker that a writer refuses, when the marker was lost, the oldest segment damaged and a writer recovered
+  between the archiver's checks of that segment and its removal (issue #83, ADR 0055; present since 1.0.0). An archiver
+  now takes the segment out of the journal with a no-replace rename, checks that it took the file it checked and that
+  the marker, read again, names a later segment (for a move by copy, also that the file still holds what was copied),
+  and only then lets it go; otherwise it renames it back and stops with the error. A writer's own retention run, which
+  holds the writer lock, is unchanged. **Behaviour changes:** a deletion, and a move by copy, now go through a temporary
+  name in the journal directory, `{base:020}.tape.{pid}.{unix_ns}.removing` (`docs/format.md`), which a crash can leave
+  behind: everything else ignores it (1.0.0 included), and a later retention run unlinks it once it is an hour old, its
+  process is gone and its segment is before the marker's (`docs/operations.md`). An archiver's removal costs a rename, a
+  `stat` and a read of the marker more than before.
 - Changed: retention reads only what its policy needs and lists the journal directory once per run (ADR 0051, issue #80).
   A checkpoint with a policy used to open every segment; now `max_segments` needs the file names, `max_age` the headers of
   the oldest segments, and `max_bytes` the file sizes (which a writer keeps between its runs) and the headers of the files
