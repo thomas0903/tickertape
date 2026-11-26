@@ -27,8 +27,9 @@ A journal is one directory. Only these names have a meaning; anything else is ig
 | `{base_seq:020}.tape` | A segment. `base_seq` is the sequence number of its first record, zero-padded to 20 decimal digits so that lexicographic order equals numeric order, e.g. `00000000000001048576.tape` |
 | `{base_seq:020}.tape.tmp` | A segment being created or repaired by the writer. Never read by readers |
 | `next-segment.tmp` | The next segment, prepared in the background before it is needed (ADR 0022): preallocated, synced and all zeros. At roll the writer writes its header and links it to `{base_seq:020}.tape` (the next checkpoint syncs it, ADR 0038). Never read by readers |
+| `{base_seq:020}.tape.{pid}.{unix_ns}.removing` | A segment that an archiver other than the writer (`retention::apply`, `tickertape archive`) is removing (ADR [0055](decisions/0055-an-archiver-takes-a-segment-out-before-it-lets-it-go.md)): renamed here out of the journal, checked, then unlinked, or renamed back if the check fails. A crash in between leaves it, and it can hold records the journal no longer has; a retention run unlinks it only when it is sealed and the segment its seal names is gone, below the oldest segment, and its name is an hour old (`unix_ns`) and its process (`pid`) gone. `status` and `archive` report it. Never read by readers, the writer or its recovery; tickertape 1.0.0 ignores it |
 | `checkpoint` | The checkpoint marker: where the last successful checkpoint ended (see "Checkpoint marker") |
-| `notify` | Wake-up record (ADRs 0017, 0021): 80 bytes naming the running writer's shared-memory wake-up region (magic `TTNOTIFY`, version, kind, nonce, pid and descriptor on Linux or object name on macOS, journal directory identity, CRC32C; layout in ADR 0021). Readers only read it with `pread`; it is replaced by rename, never written in place. Carries no journal data; deleting it or damage to it only affects reader latency |
+| `notify` | Wake-up record (ADRs 0017, 0021): 80 bytes naming the running writer's shared-memory wake-up region (magic `TTNOTIFY`, version, kind, nonce, pid and descriptor on Linux or object name on macOS, journal directory identity, CRC32C; layout in ADR 0021). Readers only read it with `pread`; it is replaced by rename, never written in place. Carries no journal data; deleting it or damage to it only affects reader latency. The region's words: ADRs 0021 and 0053 |
 | `writer.lock` | Lock file. The writer holds an exclusive `flock` on it while open and writes its PID (decimal ASCII) into it. The PID is informational; the lock is the authority |
 | `quarantine/` | Bytes and segments removed from the journal by recovery, kept so that they are not destroyed (bytes recovery zeroes in place are not kept: "Recovery (writer open)", step 4). Never read by readers, never deleted by tickertape |
 | `readers/` | Optional reader beacons (ADR [0032](decisions/0032-operational-metrics.md)): 128-byte files (magic `TTREADER`) in which applications that opt in publish a reader's position for monitoring, plus hidden temporary files (`.<name>.<pid>.<n>.beacon-tmp`) while one is created. Not part of format version 1: the writer, readers, recovery and retention never read or modify it (v0.4.0 included) |
@@ -238,7 +239,7 @@ When the next record doesn't fit in the current segment's record area, the write
    (Linux: `fallocate`; macOS: `fcntl(F_PREALLOCATE)` then `ftruncate`) and write the segment header with `pwrite`.
    The roll does not sync it: the next checkpoint syncs every segment linked before it is requested, before it writes
    its marker, and recovery restores a header that an OS crash kept from the disk (ADR 0038; crash contract C8). A
-   segment that recovery creates is synced before it is linked. A temporary file is never truncated or reopened, so a
+   segment that recovery creates is synced, with the platform barrier, before it is linked. A temporary file is never truncated or reopened, so a
    published inode can't be damaged through it.
 3. Publish it under its final name **without replacing anything**: `link` the temporary file to
    `{next_seq:020}.tape`, which fails if that name exists. **A successful `link` is the publication point.** Then
@@ -257,11 +258,18 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
 
 1. **Remove stale temporary files** (`*.tape.tmp` and `next-segment.tmp`). They are never segments (at most a
    second name for a published one).
-2. **Find the scan start.** With a current checkpoint (see "Checkpoint marker"): its segment must exist and
-   its `offset` must be a multiple of 8 in `[64, segment_size - 8]`; otherwise the journal is **refused** with a
-   corruption error under every policy, because the history the marker vouches for is missing and recreating that
-   segment could make the stale marker look valid again. Recovery then starts there, expecting `next_seq`, and
-   trusts everything before. Without a current checkpoint, it starts at offset 64 of the oldest segment, expecting
+2. **Find the scan start.** With a current checkpoint (see "Checkpoint marker"): its segment must exist,
+   its `offset` must be a multiple of 8 in `[64, segment_size - 8]`, and the segment's records must reach that
+   position: at `offset` 64, `next_seq` must be the segment's `base_seq`; at any other offset, the segment must hold a
+   valid record (see "Record") with sequence number `next_seq - 1` that ends, with its padding, exactly at `offset`.
+   Otherwise the marker is **dangling** and the journal is **refused** with a corruption error
+   (`DanglingCheckpoint`) under every policy, before anything below changes the journal: the history the marker
+   vouches for is missing (a segment restored from a backup older than the marker, or the last record it covers
+   damaged), and recreating that segment, or appending at the marker's position, would make the stale marker look
+   valid and the gap below it part of the journal. A missing segment or an invalid offset is reported at the
+   `checkpoint` file, offset 0; records that do not reach the position at the segment's path and the marker's
+   `offset` (ADR [0056](decisions/0056-marker-beyond-its-records.md), which also says what an operator does then).
+   Recovery then starts there, expecting `next_seq`, and trusts everything before the record it checked. Without a current checkpoint, it starts at offset 64 of the oldest segment, expecting
    that segment's `base_seq`. The **recovery domain** is the start segment and every segment with a larger
    `base_seq`.
 
@@ -294,7 +302,7 @@ Readers never modify a journal. Only the writer repairs it, on open, after takin
    | Commit word `0`, neither of the above | Usually the clean end, or a body the previous writer never committed (no reader saw it); also damage that left no evidence, and then this removes published records in place (C11 (3); "What readers do about repairs") | Zero any non-zero bytes after `P` in place, without a copy, under either policy. This is the end of the chain; segments the scan did not reach are disconnected (step 5). In front of a segment named `{S:020}.tape` that exists, is not `X`, has not been scanned and does not open, nothing is zeroed: non-zero bytes after `P` are corruption, as in the last row, reported as `BrokenChain(S)` (C11 (3); ADR 0035 → Damage around a seal) |
    | Valid seal, successor missing, no segment with a larger `base_seq` | Crash or power loss during a roll | Create the successor (as in "Rolling"). This is the end of the chain |
    | Valid seal, successor missing, a segment with a larger `base_seq` exists | A segment in the middle of the chain is missing (deleted by someone, or lost) | **Refuse** under every policy: tickertape doesn't discard a large part of a journal on its own |
-   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve the bytes from `P` to the last non-zero byte of `X` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it, and `rename` it over `X`. `Fail`: refuse (see below) |
+   | Commit word non-zero, invalid record or seal | Not possible after a writer *process* crash. Power loss, storage corruption or outside modification | `Quarantine` (default): preserve the bytes from `P` to the last non-zero byte of `X` in `quarantine/`, then **repair by replacement**: write a copy of `X` with `[P, Z)` zeroed to `X.tmp`, sync it with the platform barrier (the copy holds records the marker covers: ADR 0056), and `rename` it over `X`. `Fail`: refuse (see below) |
 
    Bytes are zeroed in place only after an empty commit word, in the second and third rows (crash contract C8). Some
    damage cannot be told from a torn append and is zeroed like one, destroying the records it covers without a copy
@@ -331,7 +339,9 @@ any step fails (bytes zeroed in place are not preserved: crash contract C8):
 An interrupted recovery leaves either the original or the preserved copy (or both); the next open redoes the
 repair. Leftover `.partial` files are kept as evidence. Records before `P` are never modified.
 
-Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; reading every
+Every action is reported in the writer's `RecoveryReport`. Recovery work is: listing the directory; finding and
+validating the record right before the marker's position (a backward probe of the commit words from the position to
+that record's start, and its CRC32C; work proportional to that record's length, ADR 0056); reading every
 record after the scan start (the data written since the last checkpoint); reading `[P, Z)` of the last segment to find
 non-zero bytes and, up to the last of them, checking each 8-byte position for committed history (step 4); and, only
 for repairs, copying the affected segment or tail.

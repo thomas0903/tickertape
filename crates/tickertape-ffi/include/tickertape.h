@@ -261,7 +261,8 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
   /**
-   * The checkpoint marker points to a missing segment or an impossible offset.
+   * The checkpoint marker points to a missing segment, an impossible offset, or (from 1.1) a position its segment's
+   * records do not reach (`docs/format.md` → Recovery, step 2; ADR 0056).
    */
   TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
   /**
@@ -1750,6 +1751,9 @@ void tickertape_reader_options_free(struct tickertape_reader_options *options);
  * Without a valid checkpoint marker it returns nothing; if the writer never checkpoints, it never returns a record.
  * Records it returns survive a power loss only under the crash contract's conditions: storage that honours the sync
  * calls, and no failed checkpoint earlier in the same boot (`docs/crash-contract.md`).
+ *
+ * While it waits for a checkpoint it is woken by checkpoints, not by appends (ADR 0053; beside a 1.0.0 writer it polls
+ * the marker at the maximum sleep instead).
  *
  * # Safety
  *

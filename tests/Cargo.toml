@@ -26,6 +26,10 @@ name = "recovery"
 path = "recovery.rs"
 
 [[test]]
+name = "marker_position"
+path = "marker_position.rs"
+
+[[test]]
 name = "batch"
 path = "batch.rs"
 
@@ -83,6 +87,10 @@ path = "retention.rs"
 [[test]]
 name = "retention_at_scale"
 path = "retention_at_scale.rs"
+
+[[test]]
+name = "retention_recovery_race"
+path = "retention_recovery_race.rs"
 
 [[test]]
 name = "status"

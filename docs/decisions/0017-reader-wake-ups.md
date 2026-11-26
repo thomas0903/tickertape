@@ -1,7 +1,8 @@
 # 0017: Reader wake-ups instead of sleeping
 
 - **Status:** accepted (owner decision: build the "Later" items, 2026-11-01); where the words live amended by
-  [0021](0021-notify-shared-memory.md)
+  [0021](0021-notify-shared-memory.md); durable-only readers wait for checkpoints on words of their own since
+  [0053](0053-durable-only-readers-wake-on-checkpoints.md)
 - **Date:** 2026-11-01
 
 ## Context

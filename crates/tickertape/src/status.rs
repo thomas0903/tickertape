@@ -549,6 +549,10 @@ pub struct Status {
     pub readers_dir_state: BeaconDirState,
     /// Readers with a beacon in the beacon directory, sorted by name.
     pub readers: Vec<ReaderStatus>,
+    /// Temporary names of segments that interrupted removals by an archiver left in the journal directory
+    /// (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055), sorted. Such a file may hold records the journal no longer
+    /// has; a retention run unlinks it only once newer records have been removed (`docs/operations.md`).
+    pub removal_leftovers: Vec<String>,
     /// Every segment file, for [`Status::lag`].
     files: Vec<SegFile>,
 }
@@ -978,7 +982,8 @@ impl Sampler {
 
     fn sample_once(&mut self) -> Result<Status> {
         let at = Instant::now();
-        let (mut files, mut marker) = list_with_marker(&self.dir)?;
+        let mut leftovers = Vec::new();
+        let (mut files, mut marker) = list_with_marker(&self.dir, &mut leftovers)?;
         let mut open = OpenSegments::default();
 
         // The head: scan the newest segment; if the writer rolled meanwhile, list again (and read the marker again,
@@ -1041,7 +1046,7 @@ impl Sampler {
                             )),
                         ));
                     }
-                    (files, marker) = list_with_marker(&self.dir)?;
+                    (files, marker) = list_with_marker(&self.dir, &mut leftovers)?;
                     continue;
                 }
             }
@@ -1204,6 +1209,7 @@ impl Sampler {
             readers_dir: self.readers_dir.clone(),
             readers_dir_state,
             readers: Vec::new(),
+            removal_leftovers: leftovers,
             files,
         };
         let readers = observed
@@ -1249,8 +1255,13 @@ impl Reader {
 ///
 /// An empty listing is [`Error::NotFound`], unless the marker names a segment: the writer refuses such a journal
 /// (dangling checkpoint), so it is [`Error::Corrupt`].
-fn list_with_marker(dir: &Path) -> Result<(Vec<SegFile>, Option<Marker>)> {
-    let mut files = list_files(dir)?;
+///
+/// `leftovers` gets the temporary names of interrupted removals the last listing showed ([`Status::removal_leftovers`]).
+fn list_with_marker(
+    dir: &Path,
+    leftovers: &mut Vec<String>,
+) -> Result<(Vec<SegFile>, Option<Marker>)> {
+    let mut files = list_files_and(dir, leftovers)?;
     let mut marker = read_marker(dir)?;
     let named = |m: &Option<Marker>| m.as_ref().and_then(|m| m.slot);
     let mut attempts = 0;
@@ -1267,7 +1278,7 @@ fn list_with_marker(dir: &Path) -> Result<(Vec<SegFile>, Option<Marker>)> {
                 ),
             ));
         }
-        files = list_files(dir)?;
+        files = list_files_and(dir, leftovers)?;
         let again = read_marker(dir)?;
         let unchanged = named(&again) == Some(c);
         marker = again;
@@ -1292,10 +1303,25 @@ fn list_with_marker(dir: &Path) -> Result<(Vec<SegFile>, Option<Marker>)> {
 }
 
 /// Lists the segment files with their sizes and identities (possibly none).
+#[cfg(test)]
 fn list_files(dir: &Path) -> Result<Vec<SegFile>> {
-    let listed = journal::list_segments(dir)?;
+    list_files_and(dir, &mut Vec::new())
+}
+
+/// The segment files with their sizes and identities (possibly none), and the temporary names of interrupted removals
+/// (ADR 0055) into `leftovers`, from the same listing.
+fn list_files_and(dir: &Path, leftovers: &mut Vec<String>) -> Result<Vec<SegFile>> {
+    leftovers.clear();
+    let listed = journal::list_bases_and(dir, |name| {
+        if crate::retention::is_leftover_name(name) {
+            leftovers.push(name.to_owned());
+        }
+    })?;
+    leftovers.sort();
     let mut files = Vec::with_capacity(listed.len());
-    for (base, path) in &listed {
+    for segment in &listed {
+        let base = &segment.base;
+        let path = &journal::segment_path(dir, *base);
         let meta = std::fs::metadata(path).map_err(|e| Error::io("stat segment", path, e))?;
         files.push(SegFile {
             base: *base,

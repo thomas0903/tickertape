@@ -60,6 +60,8 @@ mod journal;
 pub mod latency;
 mod mmap;
 mod notify;
+#[cfg(all(test, loom))]
+mod notify_model;
 mod prefault;
 #[cfg(all(test, loom))]
 mod protocol_model;

@@ -164,13 +164,22 @@ have a version of their own, can be deleted at any time, and are ignored by 1.0.
 (`tests/compat/v1.0.0-ignores-seek-index.sh`; the one exception is that 1.0.0's `export --output` fails with exit 1, and
 must be run again, if it cannot list `seek-index/` or the directory vanishes while it runs). A 1.0.0 writer does not
 remove indexes before it repairs a journal: readers that use them then rely on the checks by value alone (crash contract
-C15).
+C15). The temporary name an archiver gives a segment it removes (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055),
+which a crash can leave in the journal directory, is ignored by 1.0.0's readers, writer, recovery, `verify`, `status`
+and `archive` (`tests/compat/v1.0.0-ignores-removing.sh`), as by the current ones; only a current retention run unlinks
+it.
 
 **Upgrading and downgrading.**
 
 - *Upgrade:* no migration. (From 1.1 a reader returns an error where an earlier one waited for ever or ended a replay
   without one: at a zeroed commit word in older history, crash contract C11 and ADR 0050. The contract promised the
-  report, so this is a fix; a program that treats `Error::Corrupt` as fatal can stop at damage it did not see before.) Close the writer (a journal whose writer did not close is recovered at the next open as
+  report, so this is a fix; a program that treats `Error::Corrupt` as fatal can stop at damage it did not see before.
+  Also from 1.1, `Writer::open` refuses, under every recovery policy and without changing anything, a journal whose
+  checkpoint marker its segment's records do not reach, with `Error::Corrupt` and `DanglingCheckpoint` (ADR 0056):
+  segments restored from a backup while a newer `checkpoint` file was kept, or the last record the marker covers
+  damaged. 1.0.0 opened such a journal and appended after a gap that no reader can pass. Before upgrading, run
+  `tickertape verify` on journals that were restored or had storage errors; after a refusal, see `operations.md` →
+  After a crash.) Close the writer (a journal whose writer did not close is recovered at the next open as
   after a crash, crash contract C1/C2), install the new version and open the journal with it. Readers
   and CLI commands of either version can read the result. Tested: old readers on journals the new writer left.
   Not tested: an old reader process following a new writer live.

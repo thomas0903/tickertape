@@ -150,3 +150,12 @@ checkpoint with a policy cost 336 ms at 100,000 segments.
   at two sizes; another archiver, a missing segment, a damaged successor, a lost marker, a destination that goes away,
   at every point of a run), `tests/retention.rs::retention_kill_loop_50` (now kills inside a run of several removals).
   `fault::Access` and `Point::RetentionChecked` are new test hooks.
+
+## Amendment (2026-11-26): the race between the checks and the removal
+
+The race named under "Not fixed here" (issue #83) is closed by ADR
+[0055](0055-an-archiver-takes-a-segment-out-before-it-lets-it-go.md). Point 2a above holds only for a replacement made
+before the checks, and a recovery can also end its chain in the oldest segment in place, keeping its inode. So point 3
+changes for an archiver other than the writer: it takes the segment out of the journal with a no-replace rename, checks
+again that it took the file it checked and that the marker, read again, names a later segment, and only then lets the
+file go; otherwise it renames it back. A writer's own run, which holds the lock, still removes by name.
