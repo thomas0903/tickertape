@@ -184,9 +184,10 @@ pub(crate) fn run(args: ArchiveArgs, out: &mut impl Write) -> Result<()> {
             if !report.leftovers.is_empty() {
                 writeln!(
                     out,
-                    "Left {} temporary names of interrupted removals, which may hold records the journal no longer has \
+                    "Left {} temporary {} of interrupted removals, which may hold records the journal no longer has \
                      (docs/operations.md): {}",
                     report.leftovers.len(),
+                    if report.leftovers.len() == 1 { "name" } else { "names" },
                     report.leftovers.join(", ")
                 )
                 .map_err(|e| output::io_error("write archive output", e))?;

@@ -1304,8 +1304,8 @@ impl Out<'_> {
 /// covered records there (ADR 0055), and nothing names that file. So a name goes only when the file is sealed and the
 /// segment its seal names is gone from the journal, below its oldest segment (`listed`, the plan's listing): newer
 /// records have then been removed on purpose, by retention, and removing this file is what retention would have done.
-/// An unsealed file, or one whose seal names a segment still listed (or one that is not, but above the oldest), stays
-/// and is reported. As an extra guard, a name counts only once it is [`LEFTOVER_AGE_NS`] old and its process is gone,
+/// An unsealed file, or one whose seal names a segment still listed or another leftover (kept, or going in this run:
+/// it is not something retention removed), or a missing segment above the oldest, stays and is reported. As an extra guard, a name counts only once it is [`LEFTOVER_AGE_NS`] old and its process is gone,
 /// so that a removal in progress is never touched. Nothing is ever put back: a segment put in front of the oldest one
 /// could sit in front of a gap (crash contract C14).
 ///
@@ -1314,12 +1314,17 @@ impl Out<'_> {
 /// number after its last record.
 fn remove_leftovers(dir: &Path, leftovers: &[Leftover], listed: &[u64]) -> Vec<PathBuf> {
     let now = crate::clock::realtime_ns();
+    let present: Vec<u64> = listed
+        .iter()
+        .copied()
+        .chain(leftovers.iter().map(|l| l.base))
+        .collect();
     let mut left = Vec::new();
     for leftover in leftovers {
         let path = dir.join(&leftover.name);
         let goes = now.saturating_sub(leftover.unix_ns) >= LEFTOVER_AGE_NS
             && !process_alive(leftover.pid)
-            && successor_gone(&path, leftover.base, listed).unwrap_or(false);
+            && successor_gone(&path, leftover.base, listed, &present).unwrap_or(false);
         if goes {
             match fs::remove_file(&path) {
                 Ok(()) => continue,
@@ -1336,7 +1341,10 @@ fn remove_leftovers(dir: &Path, leftovers: &[Leftover], listed: &[u64]) -> Vec<P
 
 /// Whether the file at `path`, a segment taken out of the journal with base `base`, is sealed and its seal names a
 /// segment below the oldest in `listed` (see [`remove_leftovers`]).
-fn successor_gone(path: &Path, base: u64, listed: &[u64]) -> Result<bool> {
+///
+/// `present` is what counts as still there: the listed segments and the bases of all leftovers (the segment a seal names
+/// may itself be a kept leftover, which retention did not remove).
+fn successor_gone(path: &Path, base: u64, listed: &[u64], present: &[u64]) -> Result<bool> {
     let Some(&oldest) = listed.first() else {
         return Ok(false);
     };
@@ -1351,7 +1359,7 @@ fn successor_gone(path: &Path, base: u64, listed: &[u64]) -> Result<bool> {
     let Some(crc) = seal_crc_at_end(&file, path, size)? else {
         return Ok(false);
     };
-    if listed
+    if present
         .iter()
         .any(|b| *b > base && format::seal_crc(*b) == crc)
     {

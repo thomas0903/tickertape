@@ -325,10 +325,8 @@ fn crash_at(point: Point, skip: usize, run: impl FnOnce() -> tickertape::Result<
 
 /// A process that has exited (its id is not in use).
 fn dead_pid() -> u32 {
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let pid = child.id();
-    child.wait().unwrap();
-    pid
+    // Above any system's largest process id (Linux at most 2^22, macOS 99,999): never in use, and never reused.
+    i32::MAX as u32
 }
 
 fn now_ns() -> u64 {
@@ -467,9 +465,22 @@ fn a_later_run_removes_only_leftovers_whose_successor_retention_removed() {
     let kept = [
         leftover_of(dir.path(), 0, dead, now - 60_000_000_000, false),
         leftover_of(dir.path(), 0, alive, old, false),
-        leftover_of(dir.path(), 1, dead, old + 1, true),
+        leftover_of(dir.path(), 2, dead, old + 1, true),
         // Names 4, which stays.
         leftover_of(dir.path(), 3, dead, old, false),
+        // A hole: names a segment that is missing but above the oldest (copied in from a longer journal).
+        {
+            let longer = tempfile::tempdir().unwrap();
+            let mut writer = Writer::open(longer.path(), small_config()).unwrap();
+            for _ in 0..12 {
+                append(&mut writer, 42);
+            }
+            writer.checkpoint().unwrap();
+            let copied = leftover_of(longer.path(), 10, dead, old, false);
+            let path = dir.path().join(copied.file_name().unwrap());
+            fs::copy(&copied, &path).unwrap();
+            path
+        },
     ];
     let junk = dir.path().join(format!(
         "{}.{dead}.{old}.removing",
@@ -507,6 +518,40 @@ fn a_later_run_removes_only_leftovers_whose_successor_retention_removed() {
     let status = tickertape::status::status(dir.path()).unwrap();
     assert_eq!(status.removal_leftovers, names(&expected));
     assert!(inspect::verify(dir.path()).unwrap().problems.is_empty());
+}
+
+/// Two consecutive leftovers, as two crashes can leave them: the older one's seal names the newer one's segment, which
+/// retention did not remove. Both stay, and are reported, while the newer one stays; once retention has removed the
+/// segment the newer one's seal names, the run after that unlinks the newer one (the removing run's listing still
+/// shows that segment), and the run after that the older one (until then the newer one was there in the run's view).
+#[test]
+fn a_leftover_whose_seal_names_another_leftover_stays_with_it() {
+    let dir = journal();
+    let old = now_ns() - HOUR - 60_000_000_000;
+    let older = leftover_of(dir.path(), 0, dead_pid(), old, false);
+    let newer = leftover_of(dir.path(), 1, dead_pid(), old, false);
+    fs::remove_file(dir.path().join(segment_file_name(0))).unwrap();
+    fs::remove_file(dir.path().join(segment_file_name(1))).unwrap();
+    assert_eq!(bases(dir.path()), (2..N).collect::<Vec<_>>());
+    let both = names(&[older.clone(), newer.clone()]);
+    assert_eq!(
+        names(&archive_down_to(dir.path(), N as usize).leftovers),
+        both
+    );
+    assert!(older.exists() && newer.exists());
+    // Retention removes segment 2, which the newer one's seal names.
+    let report = archive_down_to(dir.path(), (N - 3) as usize);
+    assert_eq!(report.removed_segments, 1);
+    assert_eq!(names(&report.leftovers), both);
+    let report = archive_down_to(dir.path(), (N - 3) as usize);
+    assert_eq!(report.leftovers, std::slice::from_ref(&older));
+    assert!(!newer.exists());
+    assert!(
+        archive_down_to(dir.path(), (N - 3) as usize)
+            .leftovers
+            .is_empty()
+    );
+    assert!(!older.exists());
 }
 
 /// The review's sequence: an archiver checks segment 0; the marker is lost, segment 0 loses its record and seal, and

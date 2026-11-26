@@ -72,7 +72,8 @@ its seal names is gone from the journal, below the oldest segment of the run's l
 records on purpose, and removing this file is what it would have done. Which segment a seal names is told from its CRC
 word, compared with the seals of the listed bases (the end of the file only); when none matches, the file is scanned
 and validated for the sequence number after its last record. An unsealed leftover, or one whose seal names a segment
-still in the journal, stays, and `tickertape archive` (`Report::leftovers`) and `status` (`removal_leftovers`) report
+still in the journal or another leftover (which retention did not remove: two crashes can leave consecutive ones),
+stays, and `tickertape archive` (`Report::leftovers`) and `status` (`removal_leftovers`) report
 it. As extra guards, a name counts only once it is an hour old by its name and its process is gone (`kill(pid, 0)`), so
 that a removal in progress is not touched; the decision itself depends on neither. Nothing is put back automatically:
 a segment put back in front of the oldest one can sit in front of a gap if another archiver removes that oldest segment
@@ -106,6 +107,9 @@ is renamed back (`operations.md`).
   copy's check is a CRC32C, so a change that keeps the CRC is not seen. (5) A leftover is unlinked by name once the
   checks above pass; a removal in progress is protected by the age and the process test, which another PID namespace
   or a clock step can defeat, but such a file would then have to be a sealed segment whose successor retention removed.
+  (6) While another archiver has the oldest segment k out under its temporary name, a planning archiver sees k+1 as the
+  oldest and may unlink an old leftover whose seal names k; if the other archiver then puts k back, that leftover is
+  gone while its successor is in the journal. Its records are older than k, which the policy was removing.
 - **Tests.** `tests/retention_recovery_race.rs` (the reproduction; the sweep, quick and `--ignored`; a crash at each new
   step; leftovers and what removes them, the orphan of the review among them; a segment written to after it was
   copied; putting back, with and without a no-replace rename, next to a file that has

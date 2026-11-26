@@ -262,7 +262,8 @@ The same rules apply to the library and CLI, without taking the writer lock:
   - To return it to the journal, stop every writer and archiver of the journal, then rename it to `{base_seq:020}.tape`
     without replacing anything: `mv -n NAME DIR/{base_seq:020}.tape` (check that `NAME` is gone afterwards), or `ln NAME
     DIR/{base_seq:020}.tape && rm NAME`. Run `tickertape verify`: a broken chain at that segment means the segment after
-    it is gone; take it out again as above. If a writer refuses to open with a dangling checkpoint naming that
+    it is gone; take it out again as above. Put two consecutive leftovers (the older one's seal names the newer one's
+    segment) back newest first and the older one last, so that the chain is whole after each rename. If a writer refuses to open with a dangling checkpoint naming that
     `base_seq` (the archiver was killed while putting back a segment that a recovery had just restarted), this is the
     fix; for a move by rename, the file is in the destination under its segment name.
 - Moves preserve the segment basename and require an existing destination directory. Same-filesystem moves use
