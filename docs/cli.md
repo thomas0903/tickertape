@@ -513,7 +513,7 @@ From 1.1. One object per report and line:
 {"schema_version":1,"journal":string,"sampled_unix_ns":u64,"elapsed_s":number,"final":bool,
  "live":bool,"durable_only":bool,"wait":"poll"|"spin"|"block",
  "records":u64,"first_seq":u64|null,"last_seq":u64|null,
- "before_live":u64,"after_discontinuity":u64,"unset_timestamp":u64,"ahead_of_clock":u64,"discontinuities":u64,
+ "after_discontinuity":u64,"unset_timestamp":u64,"ahead_of_clock":u64,"discontinuities":u64,
  "age":HIST,"interval_age":HIST|null}
 
 HIST = {"count":u64,"min_ns":u64|null,"mean_ns":number|null,"p50_ns":u64|null,"p90_ns":u64|null,"p99_ns":u64|null,
@@ -530,9 +530,9 @@ the previous report that was written; null without an interval. `wait` may gain 
   is the sum of `age.count`, `unset_timestamp` (live records with a `local_ts_ns` of 0) and `ahead_of_clock` (live
   records with a `local_ts_ns` later than this machine's clock). **A non-zero `ahead_of_clock` biases `min_ns` and the
   percentiles upwards:** the records left out are the fastest ones.
-- `before_live` and `after_discontinuity` count the other records: those returned before the command was live for the
-  first time (none, since it starts at the end: 0 in this version), and those returned after a discontinuity until it had
-  caught up again.
+- `after_discontinuity` counts the other records: those returned after a discontinuity until the command had caught up
+  again. (The command starts at the end of the journal, so it returns no record before it is live for the first time,
+  and its output has no count of such records; `RecordAge` in the library has one, `before_live`.)
 - `discontinuities` counts discarded or removed histories the command resumed after.
 - `min_ns` and `max_ns` are exact in `age`; in `interval_age` they can be bucket bounds (never above the true minimum,
   never below the true maximum, at most 1/64 off). Percentiles are nearest rank, given as bucket upper bounds: never
