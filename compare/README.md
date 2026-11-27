@@ -167,10 +167,44 @@ TMPDIR=/mnt/test/tmp python3 compare/run.py ~/compare-sustained --sustained --ke
 
 `TMPDIR` selects the filesystem under test, as in the short mode. `benches/session.py` runs this matrix as part of a
 recorded session. Options: `--duration` (seconds per run, default 600), `--warmup` (paced seconds before the measured
-part, default 10), `--repeats` (default 2), `--tools`, `--workloads`, `--payloads`, `--rates 10000,100000` (explicit
+part, default 10), `--repeats` (default 2), `--tools`, `--workloads`, `--payloads` (64 and 1,024 by default; 256 on
+request), `--rates 10000,100000` (explicit
 rates for every tool) or `--rate-fractions 0.5,0.9` (default), `--sync-every-ms` (default 1000), `--tt-readers
 safe,mapped` (default mapped; `tt-sustained` covers both readers in depth), `--keep-going` (record a failed run in
-`failures.jsonl` and continue; the default stops) and `--dry-run`.
+`failures.jsonl` and continue; the default stops), `--send-start-latency` (below) and `--dry-run`.
+
+**Latency from the send start (`--send-start-latency`, off by default).** In the paced runs (SV, SD) every writer
+also stores its send start in the first 8 application bytes, and the reader records a second histogram from it,
+`reader_result.from_send_start`, beside the usual one from the scheduled send. The send start is the clock read that
+ends the writer's busy-wait, which every writer takes anyway to count late sends (Rust `realtime_ns()`, Java
+`Instant.now()`), so the option adds no clock read. With it on, the writer does one more 8-byte store into its record
+buffer. The reader, after the clock read that both histograms use, does one more 8-byte load from the record and one
+more histogram record: the Rust readers and the Java `Observer.sent`, which the Chronicle and Aeron adapters call right
+after `Observer.record`. Where the two languages differ: with `--events` (the JVM logs, on by default) the Java writer
+logs a late send between its clock read and the send, so on late sends that logging is inside Chronicle's and Aeron's
+latency from the send start. Each record's latency from its send start is its latency from the scheduled send minus the
+writer's delay, so it excludes a late sender's backlog: it is **not corrected for coordinated omission**, and results
+say so in `coordinated_omission_from_send_start`. It still includes the send itself (encoding, the tool's append, a
+roll or chunk change) and the read. The runner rejects a run in which it is above the latency from the scheduled send
+at any percentile. The unpaced probe stores the send start already.
+
+**With the option off the loops are the code they were before it.** In Rust, `run` has a const parameter
+(`run::<false>`, chosen once in `main_for`), and every piece of the option is in an `if STAMP` block or outside the
+loops (the second histogram is an `Option` that stays `None`; the reader's last clock read is a static). The compiled
+`run::<false>` and its closures were compared instruction by instruction (aarch64 assembly) with a copy of the source
+from which every line of the option had been deleted, and were identical. That copy differs from the code before the
+option only outside the loops: the accepted payloads, the option check, the result's `percentiles_us`, the arguments
+collected in `main_for`, and `#[inline(always)]` on `Target::idle`, which the compiler inlined anyway with one
+instantiation. In Java the option is `Harness.SendStart.ON`, a `static final` field of a holder class that is
+initialised once the options are parsed. HotSpot's compilers treat a static final field of an initialised class as a
+constant, so the loops' `if (SendStart.ON)` blocks are compiled out. `Observer.record` keeps its signature, and
+`Receiver` has two more fields (`fromSend`, null without the option, and `lastWall`).
+
+**Percentile ladder.** The live readers' histograms of the adapters in this directory (SV, SD, and W2 except
+tickertape's, which `tt-latency` measures) also carry `percentiles_us`: 50, 90, 97, 99, 99.7,
+99.9, 99.97, 99.99, 99.997 and 99.999 % and `max`, computed after the run from the same histogram. The 99.999th
+percentile needs at least 100,000 measured records to mean more than the maximum, and several million to be stable:
+60 s at 100,000 records/s is 6,000,000.
 
 **Workloads.** For every tool and payload:
 
@@ -214,10 +248,12 @@ and `results.jsonl` (all `runs/` results concatenated at the end; `runs/` is the
 `r10000` (explicit).
 
 Each result has `writer` (`count`, `planned_count`, `achieved_records_per_s`, `late_records`, `max_late_us`,
-`stopped_by`, `periodic_sync`), `java` (as in the short mode) and `reader_result` (the latency histogram as in W2; for the probe, `count` and
+`stopped_by`, `periodic_sync`), `java` (as in the short mode) and `reader_result` (the latency histogram as in W2, with
+`percentiles_us`, and `from_send_start` with `--send-start-latency`; for the probe, `count` and
 `latency`; `null` for queue-file), plus `tool`, `tool_version`, `guarantees`, `workload`, `payload`, `reader`,
 `concurrent_reader`, `rate_tag`, `rate`, `count`, `warmup`, `duration_s`, `warmup_s`, `sync_every_ms`,
-`periodic_sync_operation`, `repeat`, `quick`, start and finish times, the data directory and free space before the run.
+`periodic_sync_operation`, `send_start_latency`, `repeat`, `quick`, start and finish times, the data directory and free
+space before the run.
 
 **No hidden drops.** The runner rejects a run unless the paced writer sent every scheduled record, the reader received
 exactly the records written (minus the warmup in its histogram), the late count is in range, every percentile is
@@ -364,7 +400,7 @@ reader teardown.
 Java additionally warms the read path in that reader JVM before it opens the fixture for timing (next section);
 this avoids measuring only interpreter startup. Finite warm-ups do not prove that compilation has converged.
 
-`payload` means **application bytes only** (64 or 1,024). Tickertape uses its native
+`payload` means **application bytes only** (64 or 1,024; the sustained mode also takes 256). Tickertape uses its native
 sequence and local timestamp fields. All other tools carry an additional **16 B
 little-endian envelope**: sequence u64 then intended timestamp u64, followed by the
 application bytes. W1/W3 timestamps are zero. Plain file adds a 4 B little-endian

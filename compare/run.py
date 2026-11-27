@@ -398,12 +398,14 @@ def main():
     sustained_args.add_argument("--warmup", type=float, help="paced seconds before the measured part (default 10; quick 1)")
     sustained_args.add_argument("--repeats", type=int, help="repeats of every paced run (default 2; quick 1)")
     sustained_args.add_argument("--workloads", help="comma-separated subset of probe,SV,SD (default all)")
-    sustained_args.add_argument("--payloads", help="comma-separated subset of 64,1024 (default both)")
+    sustained_args.add_argument("--payloads", help="comma-separated subset of 64,256,1024 (default 64,1024)")
     sustained_args.add_argument("--rates", help="explicit paced rates in records/s, the same for every tool")
     sustained_args.add_argument("--rate-fractions", dest="fractions",
                                 help="paced rates as fractions of each probe's achieved rate (default 0.5,0.9)")
     sustained_args.add_argument("--sync-every-ms", type=int, default=1000, help="SD sync interval (default 1000)")
     sustained_args.add_argument("--tt-readers", help="tickertape readers: safe,mapped (default mapped)")
+    sustained_args.add_argument("--send-start-latency", action="store_true",
+                                help="paced runs: also report reader latency from each record's send start")
     affinity.add_options(parser)
     javaopts.add_arguments(parser)
     args = parser.parse_args()
@@ -429,7 +431,7 @@ def main():
         sustained.main(args, env, build)
         return
     if any([args.resume, args.dry_run, args.keep_going, args.duration, args.warmup, args.repeats, args.workloads,
-            args.payloads, args.rates, args.fractions, args.tt_readers]):
+            args.payloads, args.rates, args.fractions, args.tt_readers, args.send_start_latency]):
         parser.error("these options need --sustained")
     # Exclusive output creation prevents accidentally mixing runs with old results.
     out = args.outdir.resolve()

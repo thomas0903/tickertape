@@ -46,6 +46,8 @@ public final class Main {
                 // Touch the last payload byte without copying the mapped document.
                 b.readByte(b.readPosition()+length-17);
                 observer.record(seq,ts,length-16);
+                // --send-start: the first 8 application bytes, read in place after record's clock read.
+                if (Harness.SendStart.ON) observer.sent(b.readLong(b.readPosition()));
                 return true;
             }
         }

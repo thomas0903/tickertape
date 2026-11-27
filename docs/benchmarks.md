@@ -10,8 +10,11 @@ and [0018](decisions/0018-competitive-benchmarks.md).
 **Linux results come first** because that is where tickertape is meant to run. The
 [comparison rerun at v1.0.0](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64)
 comes first of all: it is the current comparison with other tools, run with the corrected harness on two Google Cloud
-VMs, and it supersedes the earlier comparison sections, which stay as recorded. Among the older Linux results bare
-metal comes first; the cloud-VM and macOS results are secondary.
+VMs, and it supersedes the earlier comparison sections, which stay as recorded. Right after it, Chronicle Software's
+published write-to-read example (256 B at 100,000 msgs/s) is set beside the same scenario on our machines, for
+tickertape and open-source Chronicle Queue
+([2026-11-27](#2026-11-27-chronicles-published-write-to-read-example-in-our-harness-256-b-at-100000-recordss-google-cloud-vms)).
+Among the older Linux results bare metal comes first; the cloud-VM and macOS results are secondary.
 
 The sustained-workload, checkpoint, comparison, reader and scale results and the long verified runs of 2026-11-19 to
 2026-11-22 ran on Google Cloud VMs
@@ -1072,6 +1075,263 @@ They do not show:
 - **What the settings do one by one** in the sustained mode, or `microTouch()` on top of the new settings.
 - **An interrupt-free tuned host** ([above](#interrupts-on-the-tuned-cpus)), unpinned sustained runs, Aeron on xfs in
   the sustained mode, Aeron Archive, macOS, Windows.
+
+## 2026-11-27, Chronicle's published write-to-read example in our harness (256 B at 100,000 records/s; Google Cloud VMs)
+
+The owner asked how tickertape compares with a table on the page "Module `chronicle::queue`"
+(`rustdoc.chronicle.software`): "Example write-to-read latencies for 256 byte messages written at 100,000 msgs/s on a
+commodity Ryzen 9 7950X", in nanoseconds, 50 % 241, 90 % 261, 97 % 271, 99 % 281, 99.7 % 311, 99.9 % 331, 99.97 % 461,
+99.99 % 490, 99.997 % 501, 99.999 % 521. **That row is Chronicle Software's published figure on their machine. We did
+not measure it, and we did not run the product it describes.** The page documents a Rust crate, `chronicle`, which
+needs a licence key (`CHRONICLE_KEY`). It says that queues are memory-mapped files, "either physical or tmpfs", and
+suggests a block size of about 256 MB (64 MB by default). For the table itself it does not say which version produced
+it, where the timer starts and stops, whether the queue was on tmpfs, how threads were pinned or cores isolated, the
+warm-up or the number of samples, and it links no benchmark program (read on 2026-11-27).
+
+We ran the same scenario (256 B, 100,000 records/s, the same percentile ladder) with our comparison harness, for
+tickertape and for the open-source Java Chronicle Queue 2026.8 that the harness already tests, on the two cloud machine
+types of the [comparison rerun](#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64).
+We used two storage set-ups, tmpfs and ext4 on the local SSD, five 60 s runs per cell with the tools strictly
+alternating, and reader latency measured twice in every run: from the scheduled send, as in the rerun, and from the
+actual send start. **This compares two tools on our machines.** Beside Chronicle's row it shows how far apart the
+figures are. It cannot tell how much of that gap comes from the machine, the method, the edition or the set-up. **tmpfs
+has no durability**: its rows are a ceiling, not a mode to recommend.
+
+**In short.** Measured from the send start and given as the median of five runs, the medians are of the order of
+Chronicle's published p50 and the tails are not. Open-source Chronicle Queue had p50 0.456 µs on the x86-64 VM on tmpfs
+(0.395 on aarch64) against the published 0.241. Its p99.9 was 1.61 µs (2.69) against 0.331, and its p99.999 30.2 µs
+(12.7) against 0.521. tickertape's zero-copy reader had p50 0.340 µs (0.264), the lowest median we measured, and p99
+0.527 µs on ext4 (0.428). From p99.9 up, open-source Chronicle Queue was lower than the zero-copy reader on both
+storages: on ext4, p99.9 1.59 against 3.31 µs and p99.99 3.62 against 388 µs (x86-64; 1.73 against 2.18 and 4.65
+against 461 on aarch64). The zero-copy reader's p99.99 and maximum on ext4 are probably its own pauses at the run's ~13
+segment rolls (below). tickertape's safe reader, the API without `unsafe`, had a median of 0.752–1.04 µs from the send
+start, 1.7–2.6 times open-source Chronicle's 0.395–0.456. On tmpfs, tickertape with its Linux defaults is worse than
+on ext4. Without the spare segment every roll zeroes the next 128 MiB segment on the writer's thread. That explains the
+maxima (31.6 ms on x86-64, 26.0 ms on aarch64) and the tail from the scheduled send. It does not explain the zero-copy
+reader's 1.65–4.66 ms from the send start between p99.7 and p99.999 on tmpfs. Their cause has not been found, and
+the same was seen with the spare segment on (2026-11-26). Measuring from the send start instead of the scheduled send
+removes a late sender's backlog. That lowers Chronicle's p99.9 from 4.26 to 1.61 µs on tmpfs and from
+20.8 to 1.59 µs on ext4 (x86-64). tmpfs against ext4 changes Chronicle's latency from the send start by no consistent
+amount. Our data cannot say how much of the remaining distance to the published row comes from the machine and how much
+from the edition and the set-up.
+
+### Environment and commands
+
+| | x86-64 | aarch64 |
+|---|---|---|
+| Machine (us-central1-b) | `c4-standard-16-lssd`: Intel Xeon 6985P-C (2.3 GHz base), 8 cores with 2 threads each, 58 GiB, KVM | `c4a-standard-8-lssd`: Google Axion (Neoverse-V2), 8 cores, 31 GiB, KVM |
+| Pinning (the harness's automatic plan) | writer CPU 1, reader CPU 2, helpers 0, 3–8, 11–15 (no sibling of a measured CPU) | writer CPU 1, reader CPU 2, helpers 0, 3–7 |
+| Storage | tmpfs: `mount -t tmpfs -o size=16G,mode=1777` (default `huge=never`); ext4 on the local NVMe SSD (`/data`, `noatime`) | the same, tmpfs `size=10G` |
+| Runs (UTC) | 2026-11-27 00:35 to 01:14 | 2026-11-27 01:29 to 02:02 |
+
+Ubuntu 24.04, kernel `7.0.0-1018-gcp`, clocksource `tsc` (x86-64), rustc 1.100.0, OpenJDK 21.0.13.1, Python 3.12.3,
+Maven 3.8.7. Threads were pinned, not isolated: no `isolcpus`, `nohz_full` or frequency control, and a hypervisor sat
+underneath. **Commit:** `main` at `111665f7` plus this section's harness change (patch sha256 `4ad9b0da…`, applied
+on the VM; `git status` and the diff are in the raw results). `compare-tickertape` sha256 `079e99ec…` (x86-64) and
+`a652fce1…` (aarch64); the Java classes' hashes are in `hashes.txt`. Chronicle Queue 2026.8 open source with the
+harness's settings (long JVM warm-up, `microTouch()` in the writer's busy-wait, `blockSize` 1 GiB, or 256 MiB in the
+extra cell); tickertape with its defaults (128 MiB segments, prefaulting, early write-back; the spare segment is off on
+Linux).
+
+```sh
+# per repeat r = 1..5, in this order; TMPDIR selects the storage (/mnt/tt-tmpfs/tmp or /data/tmp)
+COMMON="--sustained --workloads SV --rates 100000 --payloads 256 --duration 60 --warmup 1 --repeats 1 --send-start-latency --keep-going"
+TMPDIR=/mnt/tt-tmpfs/tmp python3 compare/run.py OUT/tmpfs-r$r-A $COMMON --tools tickertape,chronicle --tt-readers mapped,safe
+TMPDIR=/mnt/tt-tmpfs/tmp python3 compare/run.py OUT/tmpfs-r$r-B $COMMON --tools chronicle --chronicle-block-size 268435456   # x86-64 only
+TMPDIR=/data/tmp         python3 compare/run.py OUT/ext4-r$r-A  $COMMON --tools tickertape,chronicle --tt-readers mapped,safe
+```
+
+Each run is one writer process and one reader process. 6,100,000 records are due on the 100,000 records/s schedule.
+The first 100,000 (1 s) stay out of the histograms, and **6,000,000 are measured in every run**, so the 99.999th
+percentile is the 60th-highest sample. A send is never skipped: one that starts late still runs. Late sends start more
+than 1 µs after their time. Raw results (every run's JSON, `children.log`, `commands.txt`, JVM logs, the machine
+description) are kept outside the repository, one archive per machine (sha256 `2288b9af…` and `40ed25b9…`). All 65 runs passed the runner's checks: every record was received in order, and latency from the send
+start was nowhere above latency from the scheduled send. No run was repeated or left out.
+
+**The harness code changed after these runs, in two respects.** The runs used the first version of the option. In that
+version the adapters' loops tested the option at run time on every record, also when it was off; the version merged
+compiles the off path out (`compare/README.md`). The Chronicle and Aeron readers also read the send start from the
+record before the clock read; the merged version reads it after the clock read, as the Rust readers already did. The
+first difference concerns only runs with the option off, and every run here had it on. The second added one 8-byte
+load from a record line the reader had just read to both of Chronicle's histograms, before the clock read. It was not
+measured separately: it is a few nanoseconds at most, counted against Chronicle.
+
+**Late sends and the writer's lateness count all 6,100,000 sends**, including the first 100,000 that the histograms leave
+out. That is the late-sends column of every table here and the maximum lateness quoted below. Chronicle's writer logs
+every late episode of 10 µs or more, and in 22 of its 25 runs the largest lateness of the run (0.62–1.06 ms) was its
+first send after open, sequence 0, in the unmeasured first second. In the measured part (sequence 100,000 and later) its
+largest late episodes were 0.19–0.33 ms on x86-64 and 0.18–0.20 ms on aarch64. Most of them came at the 1 GiB chunk
+boundary (sequence 3,889,775), at sequence 4,194,305 or at 2,097,153. Four aarch64 ext4 runs also had one of 0.80–1.36
+ms at sequences 6.06–6.10 million, in the last 0.4 s. 163–2,009 of Chronicle's late sends per run fell in the first
+100,000. tickertape's adapter keeps no per-send log, so where its writer's maximum lateness fell is not known.
+
+**The two timer starts.** *From the scheduled send* is the harness's usual measure (`now − due`). It includes a late
+sender's backlog: when one send stalls, every record behind it starts late and is counted as late by the time it has
+waited. *From the send start* begins at the writer's clock read that ends its busy-wait. That is the same read the
+writer uses to count late sends, taken just before the record is encoded and handed to the tool. It excludes the
+backlog and includes the send (encoding, the tool's append, a roll or chunk change inside it) and the read. With the
+JVM logs on (the default), the Java writer also logs a late send between that clock read and the send, which counts
+against Chronicle; it does so only for late sends. Both measures end at the same clock read of the reader, after the
+record has been read and its sequence and length checked. The reads are not the same work. tickertape's readers check
+the record's CRC32C over the whole record before they return it, and the safe reader also copies it into its buffer.
+Chronicle's adapter checks no checksum: it reads the sequence and the timestamp in place and touches the last payload
+byte. The clock is the wall clock (`Instant.now()` in Java, `CLOCK_REALTIME` in Rust). Chronicle's "write-to-read" is
+closer to the second measure, but the page does not say where its timer starts.
+
+### Chronicle's published row beside ours: latency from the send start (µs)
+
+µs throughout, so 0.241 is 241 ns. Medians of five runs; the min–max of the runs is in the tables after this one.
+**The first row is Chronicle Software's published figure for their commercial Rust queue on a Ryzen 9 7950X, with a
+set-up the page does not describe. We did not measure it.** The figures from the send start are not corrected for
+coordinated omission: they leave a late sender's backlog out by construction. The tables from the scheduled send below
+are the measure that includes it.
+
+| Source | Machine | Storage | Tool | Reader / blockSize | p50 | p90 | p97 | p99 | p99.7 | p99.9 | p99.97 | p99.99 | p99.997 | p99.999 | max |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **published by Chronicle, not measured by us** | Ryzen 9 7950X | not stated | Chronicle `chronicle::queue` (Rust, commercial) | not stated | 0.241 | 0.261 | 0.271 | 0.281 | 0.311 | 0.331 | 0.461 | 0.490 | 0.501 | 0.521 | not stated |
+| measured, median of 5 | x86-64 VM | tmpfs | tickertape `main` | zero-copy | 0.340 | 0.448 | 0.486 | 2.06 | 1.65 ms | 2.65 ms | 3.41 ms | 3.44 ms | 3.47 ms | 3.47 ms | 31.6 ms |
+| measured, median of 5 | x86-64 VM | tmpfs | tickertape `main` | safe | 0.811 | 1.07 | 2.90 | 10.7 | 23.2 | 28.7 | 100 | 107 | 110 | 111 | 28.2 ms |
+| measured, median of 5 | x86-64 VM | tmpfs | Chronicle Queue 2026.8 (Java, open source) | 1 GiB | 0.456 | 0.539 | 0.580 | 0.718 | 1.48 | 1.61 | 1.75 | 3.82 | 7.75 | 30.2 | 322 |
+| measured, median of 5 | x86-64 VM | tmpfs | Chronicle Queue 2026.8 (Java, open source) | 256 MiB | 0.448 | 0.542 | 0.611 | 1.36 | 1.53 | 1.66 | 1.96 | 4.58 | 51.5 | 105 | 357 |
+| measured, median of 5 | x86-64 VM | ext4 | tickertape `main` | zero-copy | 0.340 | 0.447 | 0.477 | 0.527 | 1.66 | 3.31 | 6.08 | 388 | 686 | 746 | 1.00 ms |
+| measured, median of 5 | x86-64 VM | ext4 | tickertape `main` | safe | 0.752 | 0.984 | 2.06 | 2.30 | 15.9 | 16.5 | 17.1 | 17.8 | 43.1 | 62.1 | 246 |
+| measured, median of 5 | x86-64 VM | ext4 | Chronicle Queue 2026.8 (Java, open source) | 1 GiB | 0.446 | 0.537 | 0.587 | 0.638 | 0.716 | 1.59 | 2.23 | 3.62 | 9.43 | 37.9 | 351 |
+| measured, median of 5 | aarch64 VM | tmpfs | tickertape `main` | zero-copy | 0.264 | 0.358 | 0.405 | 0.453 | 1.69 ms | 2.59 ms | 4.49 ms | 4.60 ms | 4.64 ms | 4.66 ms | 26.0 ms |
+| measured, median of 5 | aarch64 VM | tmpfs | tickertape `main` | safe | 1.04 | 1.23 | 1.41 | 4.13 | 9.01 | 11.6 | 16.8 | 41.2 | 68.3 | 80.4 | 21.1 ms |
+| measured, median of 5 | aarch64 VM | tmpfs | Chronicle Queue 2026.8 (Java, open source) | 1 GiB | 0.395 | 0.467 | 0.523 | 1.27 | 2.32 | 2.69 | 3.71 | 4.87 | 6.32 | 12.7 | 282 |
+| measured, median of 5 | aarch64 VM | ext4 | tickertape `main` | zero-copy | 0.264 | 0.356 | 0.395 | 0.428 | 1.28 | 2.18 | 4.19 | 461 | 691 | 785 | 1.02 ms |
+| measured, median of 5 | aarch64 VM | ext4 | tickertape `main` | safe | 0.965 | 1.15 | 1.30 | 1.57 | 3.13 | 3.47 | 3.75 | 4.91 | 23.9 | 42.1 | 259 |
+| measured, median of 5 | aarch64 VM | ext4 | Chronicle Queue 2026.8 (Java, open source) | 1 GiB | 0.399 | 0.471 | 0.500 | 0.549 | 0.585 | 1.73 | 2.97 | 4.65 | 5.53 | 17.3 | 298 |
+
+### x86-64: every percentile, median of the runs (min–max)
+
+From the scheduled send:
+
+| Storage | Tool | Reader / blockSize | runs | p50 | p90 | p97 | p99 | p99.7 | p99.9 | p99.97 | p99.99 | p99.997 | p99.999 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| tmpfs | tickertape | zero-copy | 5 | 0.406 (0.405–0.409) | 0.513 (0.512–0.516) | 0.553 (0.550–0.568) | 2.26 (1.91–3.95) | 15.6 ms (15.4–16.0 ms) | 24.8 ms (24.6–25.1 ms) | 28.0 ms (27.8–28.3 ms) | 29.2 ms (28.9–29.6 ms) | 30.2 ms (29.9–30.8 ms) | 31.1 ms (30.8–31.7 ms) | 31.7 ms (31.4–32.3 ms) | 38,920 (36,932–97,536) |
+| tmpfs | tickertape | safe | 5 | 0.872 (0.868–0.874) | 1.14 (1.13–1.15) | 2.97 (2.96–3.08) | 11.8 (11.5–12.0) | 13.7 ms (13.4–13.8 ms) | 22.8 ms (22.5–23.0 ms) | 26.0 ms (25.7–26.1 ms) | 26.9 ms (26.6–27.1 ms) | 27.5 ms (27.1–27.7 ms) | 27.9 ms (27.7–28.0 ms) | 28.2 ms (28.1–28.4 ms) | 38,793 (37,054–96,988) |
+| tmpfs | Chronicle Queue | 1 GiB | 5 | 0.513 (0.505–0.517) | 0.601 (0.595–0.623) | 0.656 (0.639–0.693) | 2.55 (1.24–4.90) | 3.40 (1.56–5.75) | 4.26 (2.22–6.44) | 10.3 (6.12–11.7) | 30.3 (27.5–38.0) | 65.3 (61.8–76.7) | 111 (92.3–122) | 348 (323–366) | 63,420 (6,852–67,300) |
+| tmpfs | Chronicle Queue | 256 MiB | 5 | 0.505 (0.503–0.581) | 0.604 (0.598–0.686) | 1.12 (0.755–1.57) | 4.65 (1.54–4.77) | 5.51 (1.96–5.69) | 6.43 (3.01–6.78) | 13.3 (7.29–19.5) | 42.8 (30.2–63.1) | 121 (101–147) | 247 (216–275) | 359 (328–382) | 65,820 (37,741–71,920) |
+| ext4 | tickertape | zero-copy | 5 | 0.407 (0.404–0.408) | 0.514 (0.511–0.517) | 0.554 (0.549–0.571) | 0.900 (0.850–3.14) | 2.00 (1.76–3.89) | 3.50 (2.90–5.23) | 9.10 (5.94–10.8) | 388 (300–428) | 711 (614–750) | 840 (722–858) | 1.06 ms (962–1.10 ms) | 14,671 (14,098–72,950) |
+| ext4 | tickertape | safe | 5 | 0.814 (0.813–0.817) | 1.07 (1.06–1.08) | 2.19 (2.17–2.20) | 5.59 (3.12–6.51) | 16.0 (10.6–16.1) | 16.6 (16.6–16.8) | 17.3 (17.2–17.4) | 22.2 (21.9–23.0) | 83.8 (79.0–92.7) | 164 (148–171) | 259 (251–287) | 73,286 (72,126–73,889) |
+| ext4 | Chronicle Queue | 1 GiB | 5 | 0.503 (0.486–0.554) | 0.600 (0.575–0.641) | 0.664 (0.634–0.719) | 1.14 (0.926–3.40) | 11.7 (10.7–12.1) | 20.8 (19.9–21.2) | 24.5 (23.2–25.1) | 35.5 (33.8–36.9) | 66.0 (62.3–67.2) | 145 (130–146) | 372 (353–385) | 41,531 (39,463–98,360) |
+
+From the send start:
+
+| Storage | Tool | Reader / blockSize | runs | p50 | p90 | p97 | p99 | p99.7 | p99.9 | p99.97 | p99.99 | p99.997 | p99.999 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| tmpfs | tickertape | zero-copy | 5 | 0.340 (0.339–0.343) | 0.448 (0.447–0.451) | 0.486 (0.481–0.491) | 2.06 (1.79–2.20) | 1.65 ms (1.63–1.68 ms) | 2.65 ms (2.62–2.71 ms) | 3.41 ms (3.38–3.52 ms) | 3.44 ms (3.40–3.56 ms) | 3.47 ms (3.41–3.57 ms) | 3.47 ms (3.41–3.60 ms) | 31.6 ms (31.3–32.2 ms) | 38,920 (36,932–97,536) |
+| tmpfs | tickertape | safe | 5 | 0.811 (0.806–0.812) | 1.07 (1.07–1.09) | 2.90 (2.89–3.02) | 10.7 (10.6–10.9) | 23.2 (22.2–25.8) | 28.7 (28.1–31.3) | 100 (76.5–137) | 107 (82.6–141) | 110 (85.6–144) | 111 (87.1–145) | 28.2 ms (28.1–28.3 ms) | 38,793 (37,054–96,988) |
+| tmpfs | Chronicle Queue | 1 GiB | 5 | 0.456 (0.448–0.459) | 0.539 (0.533–0.560) | 0.580 (0.575–0.614) | 0.718 (0.673–0.936) | 1.48 (1.44–1.50) | 1.61 (1.57–1.65) | 1.75 (1.69–2.03) | 3.82 (2.08–4.65) | 7.75 (6.85–8.86) | 30.2 (23.6–44.7) | 322 (298–343) | 63,420 (6,852–67,300) |
+| tmpfs | Chronicle Queue | 256 MiB | 5 | 0.448 (0.447–0.523) | 0.542 (0.535–0.610) | 0.611 (0.591–1.45) | 1.36 (1.36–1.60) | 1.53 (1.52–1.74) | 1.66 (1.63–1.90) | 1.96 (1.86–3.16) | 4.58 (3.94–5.30) | 51.5 (36.6–88.1) | 105 (90.4–114) | 357 (327–381) | 65,820 (37,741–71,920) |
+| ext4 | tickertape | zero-copy | 5 | 0.340 (0.338–0.342) | 0.447 (0.446–0.450) | 0.477 (0.474–0.480) | 0.527 (0.511–0.538) | 1.66 (1.54–1.88) | 3.31 (2.74–3.45) | 6.08 (3.79–6.61) | 388 (299–428) | 686 (535–721) | 746 (627–784) | 1.00 ms (909–1.04 ms) | 14,671 (14,098–72,950) |
+| ext4 | tickertape | safe | 5 | 0.752 (0.750–0.755) | 0.984 (0.971–0.998) | 2.06 (2.03–2.06) | 2.30 (2.27–2.32) | 15.9 (9.41–16.0) | 16.5 (16.5–16.7) | 17.1 (17.0–17.2) | 17.8 (17.6–18.6) | 43.1 (31.4–55.9) | 62.1 (60.4–69.3) | 246 (222–259) | 73,286 (72,126–73,889) |
+| ext4 | Chronicle Queue | 1 GiB | 5 | 0.446 (0.429–0.496) | 0.537 (0.512–0.577) | 0.587 (0.557–0.621) | 0.638 (0.593–0.672) | 0.716 (0.642–1.25) | 1.59 (1.23–2.31) | 2.23 (1.83–2.73) | 3.62 (2.61–5.56) | 9.43 (5.09–14.0) | 37.9 (36.2–40.0) | 351 (345–358) | 41,531 (39,463–98,360) |
+
+### aarch64: every percentile, median of the runs (min–max)
+
+No 256 MiB cell on aarch64 (budget, below).
+
+From the scheduled send:
+
+| Storage | Tool | Reader / blockSize | runs | p50 | p90 | p97 | p99 | p99.7 | p99.9 | p99.97 | p99.99 | p99.997 | p99.999 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| tmpfs | tickertape | zero-copy | 5 | 0.342 (0.341–0.344) | 0.432 (0.426–0.443) | 0.484 (0.475–0.494) | 0.545 (0.540–2.52) | 7.86 ms (7.61–7.92 ms) | 17.0 ms (16.7–17.1 ms) | 20.2 ms (19.9–20.3 ms) | 22.1 ms (21.8–22.5 ms) | 24.2 ms (23.7–24.4 ms) | 25.4 ms (24.9–25.6 ms) | 26.0 ms (25.4–26.1 ms) | 26,325 (25,711–26,598) |
+| tmpfs | tickertape | safe | 5 | 1.12 (1.11–1.12) | 1.31 (1.28–1.32) | 1.49 (1.44–1.58) | 4.21 (1.72–4.63) | 5.64 ms (5.59–5.98 ms) | 14.7 ms (14.6–15.0 ms) | 17.9 ms (17.8–18.2 ms) | 18.9 ms (18.8–19.2 ms) | 19.9 ms (19.7–20.3 ms) | 20.6 ms (20.3–21.0 ms) | 21.2 ms (20.9–21.6 ms) | 28,743 (25,887–43,866) |
+| tmpfs | Chronicle Queue | 1 GiB | 5 | 0.478 (0.438–0.514) | 0.566 (0.545–0.646) | 0.618 (0.607–2.54) | 3.43 (0.845–4.03) | 4.50 (2.37–5.36) | 5.73 (2.73–6.56) | 7.81 (3.27–8.96) | 27.9 (27.3–28.5) | 48.3 (45.5–49.8) | 75.8 (70.0–79.7) | 292 (290–303) | 64,471 (3,425–87,698) |
+| ext4 | tickertape | zero-copy | 5 | 0.342 (0.341–0.348) | 0.428 (0.420–0.452) | 0.482 (0.468–0.490) | 0.544 (0.503–2.65) | 2.09 (0.552–3.33) | 2.44 (2.27–4.20) | 8.62 (5.91–28.1) | 461 (455–470) | 778 (774–786) | 869 (867–882) | 1.06 ms (1.04–1.06 ms) | 6,125 (1,660–61,609) |
+| ext4 | tickertape | safe | 5 | 1.04 (1.04–1.05) | 1.23 (1.22–1.24) | 1.40 (1.37–1.45) | 2.51 (1.69–3.84) | 3.34 (3.19–5.08) | 3.70 (3.50–5.72) | 4.16 (4.08–8.04) | 8.21 (6.25–17.4) | 105 (101–111) | 188 (183–196) | 259 (247–289) | 39,715 (9,558–62,528) |
+| ext4 | Chronicle Queue | 1 GiB | 5 | 0.484 (0.429–0.502) | 0.557 (0.499–0.572) | 0.606 (0.540–0.624) | 2.21 (0.599–2.59) | 5.28 (4.74–7.05) | 13.3 (12.1–15.5) | 18.3 (17.2–21.0) | 25.6 (21.9–26.1) | 90.6 (30.4–316) | 678 (77.2–889) | 1.25 ms (321–1.36 ms) | 57,798 (27,067–93,600) |
+
+From the send start:
+
+| Storage | Tool | Reader / blockSize | runs | p50 | p90 | p97 | p99 | p99.7 | p99.9 | p99.97 | p99.99 | p99.997 | p99.999 | max | late sends |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| tmpfs | tickertape | zero-copy | 5 | 0.264 (0.263–0.266) | 0.358 (0.355–0.364) | 0.405 (0.396–0.413) | 0.453 (0.451–2.41) | 1.69 ms (1.66–1.70 ms) | 2.59 ms (2.54–2.81 ms) | 4.49 ms (4.46–4.69 ms) | 4.60 ms (4.57–4.80 ms) | 4.64 ms (4.61–4.84 ms) | 4.66 ms (4.62–4.85 ms) | 26.0 ms (25.4–26.1 ms) | 26,325 (25,711–26,598) |
+| tmpfs | tickertape | safe | 5 | 1.04 (1.03–1.05) | 1.23 (1.20–1.24) | 1.41 (1.36–1.45) | 4.13 (1.55–4.53) | 9.01 (8.86–9.05) | 11.6 (11.3–11.8) | 16.8 (15.6–20.2) | 41.2 (29.0–64.9) | 68.3 (56.2–93.1) | 80.4 (63.8–100) | 21.1 ms (20.8–21.5 ms) | 28,743 (25,887–43,866) |
+| tmpfs | Chronicle Queue | 1 GiB | 5 | 0.395 (0.355–0.430) | 0.467 (0.452–0.532) | 0.523 (0.496–2.24) | 1.27 (0.607–2.67) | 2.32 (2.21–3.35) | 2.69 (2.57–3.96) | 3.71 (2.75–4.73) | 4.87 (2.88–7.03) | 6.32 (3.52–9.03) | 12.7 (11.5–14.9) | 282 (280–292) | 64,471 (3,425–87,698) |
+| ext4 | tickertape | zero-copy | 5 | 0.264 (0.263–0.269) | 0.356 (0.350–0.369) | 0.395 (0.387–0.407) | 0.428 (0.422–0.482) | 1.28 (0.458–2.88) | 2.18 (2.08–3.97) | 4.19 (3.91–5.97) | 461 (455–470) | 691 (681–697) | 785 (773–793) | 1.02 ms (1.01–1.03 ms) | 6,125 (1,660–61,609) |
+| ext4 | tickertape | safe | 5 | 0.965 (0.958–0.969) | 1.15 (1.14–1.16) | 1.30 (1.26–1.33) | 1.57 (1.38–2.58) | 3.13 (3.07–3.46) | 3.47 (3.37–4.97) | 3.75 (3.68–5.74) | 4.91 (4.47–8.57) | 23.9 (22.1–25.8) | 42.1 (40.5–50.7) | 259 (245–265) | 39,715 (9,558–62,528) |
+| ext4 | Chronicle Queue | 1 GiB | 5 | 0.399 (0.348–0.418) | 0.471 (0.417–0.486) | 0.500 (0.441–0.519) | 0.549 (0.480–0.552) | 0.585 (0.514–2.08) | 1.73 (0.653–2.53) | 2.97 (1.69–4.40) | 4.65 (2.55–4.77) | 5.53 (4.87–6.86) | 17.3 (9.91–26.1) | 298 (285–310) | 57,798 (27,067–93,600) |
+
+### What is the same and what is not
+
+| | Chronicle's published row | Our runs |
+|---|---|---|
+| Payload, rate, percentiles | 256 B, 100,000 msgs/s, 50 % to 99.999 % | the same (256 application bytes; Chronicle's and Aeron's adapters add a 16 B envelope, tickertape uses its own header fields) |
+| Product | `chronicle` crate (Rust, commercial, licence key); version not stated | tickertape `main`; Chronicle Queue 2026.8, the open-source Java edition. We cannot run the Rust crate (licence; the harness compares open-source editions, ADR 0018) |
+| Machine | Ryzen 9 7950X, a 16-core desktop CPU up to 5.7 GHz; presumably bare metal (not stated) | cloud VMs under KVM: Xeon 6985P-C at 2.3 GHz base, and Axion |
+| Storage | "physical or tmpfs" in general; not stated for the table | tmpfs and ext4 on a local SSD, each reported |
+| Block size | ~256 MB suggested; not stated for the table | 1 GiB (the harness's setting) and 256 MiB (one cell) |
+| Timer start and stop | "write-to-read"; not stated | both measures above, wall clock |
+| Isolation | not stated | pinned to physical cores of one L3, nothing isolated, a hypervisor |
+| Warm-up, samples | not stated | the harness's long JVM warm-up; 100,000 records excluded, 6,000,000 measured per run, five runs |
+
+### What our data says about each difference
+
+- **The timer start.** For Chronicle the start accounts for most of the tail between p97 and p99.99. On x86-64 tmpfs
+  p99 falls from 2.55 to 0.718 µs, p99.9 from 4.26 to 1.61 and p99.99 from 30.3 to 3.82. On ext4 p99.9 falls from 20.8
+  to 1.59. Chronicle's writer was late in 0.7–1.1 % of all sends (medians of 41,531–65,820 per run). In the measured
+  part no send started more than 0.18–0.33 ms late (0.80–1.36 ms in four aarch64 ext4 runs; above), and every late
+  send makes the records behind it late. For tickertape's zero-copy reader the start moves p50 by about 65 ns (0.407 to
+  0.340 µs on x86-64) and p99 from 0.900 to 0.527 on ext4, and leaves p99.99 where it is (388 µs): that tail happens
+  inside the send and read, not before them. With the zero-copy reader fewer of tickertape's sends were late than
+  Chronicle's on ext4 (medians 14,671 per run on x86-64 and 6,125 on aarch64). With the safe reader, on the same writer
+  and settings, more were late on x86-64 (73,286 against Chronicle's 41,531) and fewer on aarch64 (39,715 against
+  57,798).
+- **tmpfs against ext4.** Measured from the send start, Chronicle's rows on the two storages are within each other's
+  run ranges or close to them. x86-64 p99.9 was 1.61 against 1.59 µs and p99.99 3.82 against 3.62. On aarch64 p99.9 was
+  2.69 against 1.73, p99.99 4.87 against 4.65 and p99.999 12.7 against 17.3. Measured from the scheduled send, ext4
+  shows up as more late sends: Chronicle's p99.9 was 20.8 µs on ext4 against 4.26 on tmpfs (x86-64), and 13.3 against
+  5.73 on aarch64. For tickertape with its Linux defaults tmpfs is worse. `fallocate` on tmpfs allocates and zeroes the
+  whole next segment on the writer's thread at every roll (writer's maximum lateness 28 ms on x86-64 and 21 ms on aarch64; measured
+  separately [on 2026-11-26](#2026-11-26-how-much-of-the-limit-is-the-disk-fio-tmpfs-and-one-change-at-a-time-google-cloud-vms)
+  at 27–30 ms per roll on x86-64 and 19 ms on aarch64). That puts p99.7 and above at 15.6–31.7 ms from the scheduled
+  send. tickertape's opt-in spare segment (`WriterConfig::spare_segment(true)`) moves that work to its own thread
+  (roll appends of 26–38 µs in that section), but these runs did not measure it. On tmpfs the zero-copy reader also has
+  1.65–3.47 ms from the send start between p99.7 and p99.999 (x86-64; 1.69–4.66 ms on aarch64), and the safe reader
+  does not. That is consistent with the one tmpfs run with a spare on 2026-11-26 (zero-copy p99.9 0.97–1.2 ms). The
+  cause has not been looked into.
+- **256 B against 64 B.** In the rerun's W2 at 64 B and 100,000 records/s on ext4 (from the scheduled send),
+  tickertape's zero-copy reader had p50 0.30, p99 0.47–0.49, p99.9 2.27–5.96 and max 70.1–80.0 µs on x86-64. Here it
+  has 0.407, 0.900, 3.50 and 1.06 ms. Chronicle had 0.44–0.54, 0.60–5.52, 11.8–15.3 and 123–143 µs there, and 0.503,
+  1.14, 20.8 and 372 µs here. The payload is not the only difference. The rerun's W2 measured 1,000,000 records in
+  11 s, which fit in one tickertape segment and one Chronicle 1 GiB chunk. A 61 s run at 256 B rolls about 13
+  tickertape segments and crosses one 1 GiB chunk boundary (or about six 256 MiB ones). tickertape's W2 in the rerun ran
+  through `tt-latency`, not the adapter used here. So the medians grew by about 0.1 µs (tickertape) and 0 to 0.06 µs
+  (Chronicle) with the larger record. tickertape's p99.99 and maximum here are probably the zero-copy reader's pauses
+  at rolls, which the rerun's W2 never reached, rather than the payload. The arithmetic fits: 296 B frames × 6.1
+  million records is about 13.4 rolls, and the 600 records above p99.99 are about 46 per roll. The data puts it on the
+  reader's side. On x86-64 ext4 the writer was never more than 0.17–0.20 ms late, while the maximum from the send start
+  was 0.91–1.04 ms. The safe reader behind the same writer had p99.99 17.8 µs (4.91 on aarch64). No per-record timing
+  ties those samples to the rolls.
+- **The block size.** On x86-64 tmpfs Chronicle with 256 MiB chunks had a lower p50 than with 1 GiB (0.448 against
+  0.456 µs from the send start) and a higher tail: p99 1.36 against 0.718, p99.997 51.5 against 7.75 and p99.999 105
+  against 30.2. Those runs cross about five more chunk boundaries.
+- **The machine, the method and the edition together.** Open-source Chronicle Queue on our x86-64 VM, tmpfs, from the
+  send start, sits 1.9 times above the published row at p50 (0.456 against 0.241 µs), 2.6 times at p99, 4.9 times at
+  p99.9, 7.8 times at p99.99 and 58 times at p99.999. On aarch64 the ratios are 1.6, 4.5, 8.1, 9.9 and 24. This is the
+  combined distance from their machine, edition and unknown set-up to ours, measured with one queue design. It does not
+  separate those three, and it is no measurement of their product. tickertape's zero-copy reader, from the send start,
+  is 1.4 times the published p50 on x86-64 (0.340 µs) and 1.1 times on aarch64 (0.264), and 1.9 and 1.5 times at p99 on
+  ext4. Its p99.9 (2.18–3.31 µs) and everything above lie far above the published row.
+
+### What would be needed to compare on equal terms
+
+A bare-metal machine of the 7950X class (a high-clock desktop CPU) with isolated cores (`isolcpus`, `nohz_full`, IRQ
+affinity away from them, fixed frequency) and the journal on tmpfs. Chronicle's own set-up for the table: which
+version of the crate, where the timer starts and stops, which clock, the warm-up, the number of samples, the block size
+and the pinning. Ideally their benchmark program, or Chronicle running this harness's 256 B SV cell on that machine.
+Measuring their Rust crate ourselves needs a licence, which this suite does not use (ADR 0018). None of these runs was
+on such a machine. The cheapest step towards it would repeat these cells on one bare-metal machine with isolated cores
+and add tickertape with the spare segment on tmpfs.
+
+### Not measured
+
+Aeron IPC (the reference row cost extra machine time), Chronicle with 256 MiB chunks on ext4 and on aarch64,
+tickertape with `spare_segment(true)`, xfs, unpinned runs and the 64 B and 1,024 B payloads at this length. The
+session's budget was A$2 (A$1.85 used).
 
 ## 2026-11-02, v0.4.0 on bare-metal Linux (AWS `z1d.metal`)
 

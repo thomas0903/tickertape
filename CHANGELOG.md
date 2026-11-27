@@ -5,6 +5,19 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Added (comparison harness): the sustained mode takes `--payloads 256` (the adapters accept 64, 256 and 1,024 B;
+  the defaults stay 64 and 1,024) and `--send-start-latency`. With the latter, in paced runs, every writer stores its
+  send start (the clock read that ends its busy-wait) in the first 8 application bytes and the reader records a second
+  histogram, `reader_result.from_send_start`, which leaves a late sender's backlog out (not corrected for coordinated
+  omission; the histogram from the scheduled send stays the one that is). With the option off the adapters' loops are
+  the code they were before it (`compare/README.md`). Changed: every live reader result of the adapters in `compare/`
+  (SV, SD and short-mode W2, not tickertape's W2, which `tt-latency` measures) now also carries `percentiles_us` (50
+  to 99.999 % and the maximum), with the option off too; the existing fields are unchanged.
+- Docs: `docs/benchmarks.md` sets Chronicle Software's published write-to-read example (256 B at 100,000 msgs/s on a
+  Ryzen 9 7950X, their commercial Rust queue) beside the same scenario on two Google Cloud VMs for tickertape and
+  open-source Chronicle Queue 2026.8, on tmpfs and ext4, from the scheduled send and from the send start; the
+  published row is labelled as theirs, not measured by us.
+
 ## [1.1.0] - 2026-11-27
 
 A minor release: seek indexes and `tickertape index`, `Reader::seek_to_end` in every binding, opt-in latency histograms

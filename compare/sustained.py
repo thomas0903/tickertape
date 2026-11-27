@@ -184,10 +184,19 @@ def write_atomic(path, text):
     os.replace(tmp, path)
 
 
+# The live reader's percentile ladder (`percentiles_us`, adapters of this checkout), in order, then the maximum.
+LADDER = ("50", "90", "97", "99", "99.7", "99.9", "99.97", "99.99", "99.997", "99.999", "max")
+
+
 def validate_histogram(stats, name):
     values = [stats[key] for key in ("min_us", "p50_us", "p90_us", "p99_us", "p99_9_us", "p99_99_us", "max_us")]
     assert all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in values), f"{name}: {values}"
     assert values == sorted(values), f"{name} percentiles out of order: {values}"
+    if "percentiles_us" in stats:
+        ladder = [stats["percentiles_us"][key] for key in LADDER]
+        assert all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in ladder), f"{name}: {ladder}"
+        assert ladder == sorted(ladder), f"{name} percentile ladder out of order: {ladder}"
+        assert ladder[-1] == stats["max_us"], f"{name}: ladder maximum differs"
 
 
 def validate_sustained(result):
@@ -217,6 +226,16 @@ def validate_sustained(result):
         latency = reader
         assert latency["count"] == writer["count"] - result["warmup"], "reader did not receive every record"
     validate_histogram(latency, "latency")
+    if result.get("send_start_latency") and result["workload"] != "probe":
+        # Each record's latency from its send start is the one from its intended time minus the writer's delay, both
+        # from the same clock read of the reader: never more, at any percentile.
+        sent = reader["from_send_start"]
+        assert sent["count"] == latency["count"], "send-start histogram has another count"
+        validate_histogram(sent, "latency from send start")
+        assert "percentiles_us" in sent and "percentiles_us" in latency, "percentile ladder missing"
+        for key in LADDER:
+            assert sent["percentiles_us"][key] <= latency["percentiles_us"][key], \
+                f"latency from send start above latency from intended time at {key}"
 
 
 def adapter_command(run, role, data, control, count, warmup, rate, params, out=None):
@@ -228,6 +247,8 @@ def adapter_command(run, role, data, control, count, warmup, rate, params, out=N
         cmd += ["--duration-ms", str(int(params["duration_s"] * 1000))]
     if run.workload == "SD":
         cmd += ["--sync-every-ms", str(params["sync_every_ms"])]
+    if params.get("send_start_latency") and run.workload != "probe":
+        cmd += ["--send-start", "on"]
     if run.tool in JAVA_TOOLS:
         cmd = javaopts.wrap(cmd, run.tool, params["java"], params["quick"], True, out, f"{run.label}-{role}")
     return cmd + affinity.adapter_options(params.get("affinity"), run.tool, role)
@@ -346,6 +367,12 @@ def run_attempt(run, params, out, env, commands):
         repeat=run.repeat, quick=params["quick"], started_utc=started,
         finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), data_dir=str(tmp_root),
         free_bytes_before=free,
+        send_start_latency=bool(params.get("send_start_latency")) and run.workload != "probe",
+        # The histogram from the send start (reader_result.from_send_start) leaves a late sender's backlog out by
+        # construction; the one from the intended times is the measure that is free of coordinated omission.
+        coordinated_omission_from_send_start="from each record's send start: a late sender's backlog is excluded, "
+        "not corrected for coordinated omission" if params.get("send_start_latency") and run.workload != "probe"
+        else None,
         coordinated_omission="unpaced probe: latency from send start" if run.workload == "probe"
         else "intended timestamps; no skipped sends or rebasing")
     return result
@@ -433,7 +460,7 @@ def parameters(args):
     payloads = [int(p) for p in (args.payloads or "64,1024").split(",")]
     tt_readers = (args.tt_readers or "mapped").split(",")
     for value, allowed, name in [(tools, DEFAULT_TOOLS, "tool"), (workloads, WORKLOADS, "workload"),
-                                 (payloads, (64, 1024), "payload"), (tt_readers, ("safe", "mapped"), "reader")]:
+                                 (payloads, (64, 256, 1024), "payload"), (tt_readers, ("safe", "mapped"), "reader")]:
         bad = [v for v in value if v not in allowed]
         if bad or len(set(value)) != len(value):
             raise ValueError(f"invalid or repeated {name}: {bad or value}")
@@ -451,7 +478,8 @@ def parameters(args):
     return {"tools": tools, "workloads": workloads, "payloads": payloads, "tt_readers": tt_readers,
             "duration_s": duration, "warmup_s": warmup, "repeats": repeats, "rates": rates,
             "fractions": [] if rates else fractions, "sync_every_ms": args.sync_every_ms, "quick": quick,
-            "needs_probe": "probe" in workloads, "java": javaopts.settings(args)}
+            "needs_probe": "probe" in workloads, "java": javaopts.settings(args),
+            "send_start_latency": bool(getattr(args, "send_start_latency", False))}
 
 
 def prepare_output(out, params, resume):
@@ -467,6 +495,7 @@ def prepare_output(out, params, resume):
         if "affinity" in params:
             # Matrices started before pinning existed were unpinned.
             previous.setdefault("affinity", {"mode": "none", "summary": "affinity: none (--no-pin)"})
+        previous.setdefault("send_start_latency", False)  # Matrices started before the option existed.
         if previous != params:
             raise ValueError(f"OUTDIR was started with different parameters:\n  {previous}\n  now {params}")
         return False

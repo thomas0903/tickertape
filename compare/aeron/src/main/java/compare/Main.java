@@ -24,6 +24,8 @@ public final class Main {
             data.getByte(offset+length-1);
             observer.record(data.getLong(offset,ByteOrder.LITTLE_ENDIAN),
                 data.getLong(offset+8,ByteOrder.LITTLE_ENDIAN),length-16);
+            // --send-start: the first 8 application bytes, after record's clock read.
+            if (Harness.SendStart.ON) observer.sent(data.getLong(offset+16,ByteOrder.LITTLE_ENDIAN));
         };
         IpcEndpoint(String role, Path dir) {
             String directory=dir.resolve("driver").toString();
