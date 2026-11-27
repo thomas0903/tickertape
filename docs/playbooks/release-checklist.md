@@ -139,7 +139,17 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    refuses a tag whose versions or bindings lockfile disagree. The CLI wheel takes its version from the workspace.
    Set the C header's version macros to match (`TICKERTAPE_VERSION_MAJOR`, `_MINOR`, `_PATCH` in
    `crates/tickertape-ffi/src/lib.rs`; the build fails until they do) and regenerate the header with cbindgen 0.29.4 (the command is in `crates/tickertape-ffi/cbindgen.toml`).
-2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, and update its compare link.
+   The version also appears in these, which no check compares with the tag: the lockfiles of `compare/`, `fuzz/` and
+   `integrations/iceoryx2` (`cargo update --workspace --manifest-path <dir>/Cargo.toml` in each, and the root
+   `Cargo.lock`), the `tickertape` requirement in `integrations/iceoryx2/Cargo.toml` (two lines), the README's status
+   line and docs.rs link, `crates/tickertape/README.md`'s docs.rs link, the jar names in `bindings/java/README.md` and
+   `docs/java-api.md` (and its "here" version), and the placeholder of `.github/ISSUE_TEMPLATE/bug_report.yml`. At a
+   stable release, also the sentence on the ABI baseline in `docs/compatibility.md` (C ABI → The baseline check). Then
+   `git grep -n '<previous version>'` and judge each hit: most are history ("beside a 1.0.0 writer", changelog
+   sections, benchmark records) and stay.
+2. Add a dated `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md`, and update its compare link. The date is the tag's:
+   if the tag is not made on the day the preparation pull request merges, correct the date in that pull request
+   before it merges, or in a follow-up before the tag.
 3. Check the packages and run the normal checks:
 
    ```sh
@@ -271,21 +281,33 @@ For the 1.0 release, and checked again for every later release that ships the C 
    --destdir "$STAGE"`), and check its name in the files. The release archive's soname and install name are checked
    by `crates/tickertape-ffi/scripts/install-test.sh` in CI and in the release workflow; check them once by hand in
    an archive built with `release.py c-build` and `c-package` too:
-   - Linux: `readelf -d "$STAGE"/usr/local/lib/libtickertape.so.1* | grep SONAME` prints `libtickertape.so.1`, and
-     `libtickertape.so.1` is a link to the real file.
+   - Linux: `readelf -d "$STAGE"/usr/local/lib/libtickertape.so.1.* | grep SONAME` prints `libtickertape.so.1`, and
+     `libtickertape.so.1` is a link to the real file. On Debian and Ubuntu cargo-c installs into the multiarch
+     directory (`lib/aarch64-linux-gnu`, `lib/x86_64-linux-gnu`): look there, or pass `--libdir`.
    - macOS: `otool -D "$STAGE"/usr/local/lib/libtickertape.1.dylib` prints an install name ending in
      `libtickertape.1.dylib` (`@rpath/` or the install prefix, never a build directory).
 4. Link a program against the installed package, not the build tree, and run it: install into a scratch prefix,
    then build `examples/c/writer.c` and `reader.c` with `pkg-config --cflags --libs tickertape`, with
    `PKG_CONFIG_PATH` pointing at the scratch prefix, and run `examples/c/README.md`'s record-and-replay commands. Check
-   that the program loads the installed library (`ldd` on Linux, `otool -L` on macOS). The static library is checked
-   through the release archive only: `install-test.sh` on an archive built with `release.py c-build` and `c-package`
-   links the examples with the archive's `tickertape-static.pc`, which names `libtickertape.a`, and checks that they
-   load no tickertape library. A `cargo cinstall` package has no such check today: its one `tickertape.pc` gives
-   `-ltickertape` under `pkg-config --static` too, and the linker then takes the shared library, on Linux and macOS
-   alike (found preparing 1.1.0); a static program links `libtickertape.a` by its path.
-4. Merge the release preparation pull request and wait for all CI jobs on the resulting `main` commit to pass.
-5. Confirm the owner has authorized publishing that exact version, then tag that commit:
+   that the program loads the installed library (`ldd` on Linux, `otool -L` on macOS).
+5. Link the static library from the same package and run the same commands. `pkg-config --static --libs tickertape`
+   does not do it with a `cargo cinstall` package: its one `tickertape.pc` gives `-ltickertape`, and the linker takes
+   the shared library beside the archive, on Linux and macOS alike (found preparing 1.1.0; such a "static" program then
+   fails to start outside the prefix with "libtickertape.so.1: cannot open shared object file"). Force the archive and
+   take only the system libraries from pkg-config (`X=$(pkg-config --static --libs-only-l tickertape | sed
+   's/-ltickertape//')`):
+   - Linux: `cc reader.c $(pkg-config --cflags --libs-only-L tickertape) -Wl,-Bstatic -ltickertape -Wl,-Bdynamic $X`,
+     or `"$PREFIX/lib/libtickertape.a" $X` in place of the `-Bstatic` group;
+   - macOS, whose linker has no `-Bstatic`: `cc reader.c $(pkg-config --cflags tickertape)
+     "$PREFIX/lib/libtickertape.a" $X`.
+
+   `ldd` or `otool -L` must then show no tickertape library. The release archive needs none of this: its
+   `tickertape-static.pc` names `libtickertape.a`, and `install-test.sh` checks the static programs it builds with it.
+
+### Merge and tag (every release)
+
+1. Merge the release preparation pull request and wait for all CI jobs on the resulting `main` commit to pass.
+2. Confirm the owner has authorized publishing that exact version, then tag that commit:
 
    ```sh
    git tag -a vX.Y.Z <main-commit> -m "tickertape vX.Y.Z"

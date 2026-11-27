@@ -6758,13 +6758,15 @@ per-round ratios to the base, with its range and the rounds in which the build w
 | Durable-only reader (block): voluntary switches | 421,530 (279,122–436,975) | 407,624 (343,293–445,511) | 2,518 (2,513–2,522) | 0.970 (0.899–1.230), 3/10 | 0.006 (0.006–0.009), 0/10 |
 
 - The durable-only reader's CPU and context switches fall by two orders of magnitude, as the checklist expects once
-  (ADR 0053: it is woken by checkpoints, not by every append), and with them the writer's system CPU and its p50 to
-  p99.9.
+  (ADR 0053: it is woken by checkpoints, not by every append). The writer's lower system CPU and p50 to p99.9 are
+  consistent with ADR 0053 (no wake-up call per append for that reader); the candidate also contains ADR 0058 and 0059,
+  and no run isolates either.
 - The writer's maximum is the one figure that is higher, by more than the copy differs, in 6 of 10 rounds. In every
   candidate run it is a roll's `append` (in 6 base and 9 copy runs too), and the roll appends are slower: p50 151 µs
   (146–167) base, 150 µs (148–159) copy, 162 µs (150–171) candidate; maximum 168, 166 and 183 µs (medians); 14 rolls
-  per run in each build. This is the cost ADR 0058 change 1 recorded at a roll, which now writes back the old
-  segment's last block ("2026-11-26, early write-back to the folio boundary" above, and that change's changelog
+  per run in each build; per round the candidate's roll p50 is 1.077 times the base's (0.948–1.142), higher in 8 of 10
+  rounds, the copy's 1.015 (6/10). This is consistent with the cost ADR 0058 change 1 recorded at a roll, which now
+  writes back the old segment's last block ("2026-11-26, early write-back to the folio boundary" above, and that change's changelog
   entry). It is attributed by that mechanism, not by a run that isolates it.
 
 ### Replay (x86-64 and aarch64)
@@ -6782,10 +6784,10 @@ the page cache), the middle estimate. Per case: the base's median, then the medi
 
 | Machine | Case | Base median | Copy / base, rounds slower | Candidate / base, rounds slower | Candidate / copy, rounds slower |
 |---|---|---|---|---|---|
-| x86-64 | safe, 64 B | 37.1 ms | 0.996 (0.923–1.048), 3/10 | 1.009 (0.948–1.083), 7/10 | – |
-| x86-64 | safe, 1,024 B | 13.9 ms | 0.962 (0.829–1.092), 4/10 | 0.962 (0.805–1.032), 2/10 | – |
-| x86-64 | mapped, 64 B | 50.7 ms | 1.010 (0.947–1.074), 7/10 | 0.980 (0.927–1.061), 4/10 | – |
-| x86-64 | mapped, 1,024 B | 10.6 ms | 0.986 (0.924–1.050), 3/10 | 1.001 (0.925–1.096), 5/10 | – |
+| x86-64 | safe, 64 B | 37.1 ms | 0.996 (0.923–1.048), 3/10 | 1.009 (0.948–1.083), 7/10 | 1.028 (0.993–1.088), 8/10 |
+| x86-64 | safe, 1,024 B | 13.9 ms | 0.962 (0.829–1.092), 4/10 | 0.962 (0.805–1.032), 2/10 | 0.951 (0.912–1.067), 4/10 |
+| x86-64 | mapped, 64 B | 50.7 ms | 1.010 (0.947–1.074), 7/10 | 0.980 (0.927–1.061), 4/10 | 0.976 (0.918–0.991), 0/10 |
+| x86-64 | mapped, 1,024 B | 10.6 ms | 0.986 (0.924–1.050), 3/10 | 1.001 (0.925–1.096), 5/10 | 1.022 (0.935–1.114), 7/10 |
 | aarch64 | safe, 64 B | 38.7 ms | 1.003 (0.974–1.020), 6/10 | 1.009 (0.998–1.024), 9/10 | 1.004 (0.996–1.029), 7/10 |
 | aarch64 | safe, 1,024 B | 15.5 ms | 0.999 (0.993–1.024), 5/10 | 0.995 (0.989–1.009), 4/10 | 0.997 (0.984–1.012), 4/10 |
 | aarch64 | mapped, 64 B | 36.3 ms | 1.008 (0.987–1.026), 8/10 | 1.012 (1.002–1.035), 10/10 | 1.005 (0.997–1.023), 8/10 |

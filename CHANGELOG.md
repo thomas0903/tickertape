@@ -79,13 +79,13 @@ describes what is released.
   no large folios, no gate figure differed. The first gate set for this default ("no cell worse") was narrowly missed
   and the orchestrator accepted it (ADR 0058 → "Decision for change 1"); a private constant,
   `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour. The release check of 1.1.0 against 1.0.0 (x86-64,
-  kernel 7.0, 1,024 B at 100,000 records/s with background checkpoints every second, 10 rounds;
-  `docs/benchmarks.md` → "2026-11-27, release 1.1.0 against 1.0.0") shows the same cost at a roll: the roll's append
-  p50 151 → 162 µs and the writer's maximum, a roll in every run, 172 → 183 µs (medians of the rounds; the second copy
-  of 1.0.0 166 µs), while p50, p99 and p99.9 fell. It is attributed by its mechanism, not by a separate run.
+  kernel 7.0, 1,024 B at 100,000 records/s with background checkpoints every second, 10 rounds; `docs/benchmarks.md` →
+  "2026-11-27, release 1.1.0 against 1.0.0") is consistent with that cost at a roll: the roll's append p50 151 → 162 µs
+  and the writer's maximum, a roll in every run, 172 → 183 µs (medians of the rounds; the second copy of 1.0.0 166 µs),
+  while p50, p99 and p99.9 fell. It is attributed by its mechanism, not by a separate run.
 - Changed (Linux): a writer that rolls without checkpoints, or faster than its checkpoints take segments off its hands,
   no longer unmaps and closes the oldest segment it keeps open inside the roll's `append`: the prefault helper
-  (`tickertape-prefault`) does it, once it has caught up with prefaulting (ADR 0059, proposed; part of issue #60). At
+  (`tickertape-prefault`) does it, once it has caught up with prefaulting (ADR 0059, accepted; part of issue #60). At
   most two such segments wait for the helper, the one it is closing included; when two wait, or the helper has ended (it
   panicked), the writer closes the next one itself, as before, and it never waits for the helper. The same goes for a
   `request_checkpoint` that lets go of segments. Unmapping and closing writes nothing, so durability and readers are
@@ -195,10 +195,11 @@ describes what is released.
   have no index. `seek_index::build` removes an index it has just published if it cannot check, for another reason than
   "not found", that the segment is still in place. The on-disk format stays version 1, released versions ignore the
   files (except that 1.0.0's `export --output` fails if it cannot list the directory), and the C ABI stays at ABI
-  version 1 (an added function). The alias check of `export --output` no longer descends into `seek-index/`. - Added:
-  `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek indexes of
-  segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and `archive` remove
-  a segment's index after the segment. Without a `seek-index/` directory this is one failed `open` each.
+  version 1 (an added function). The alias check of `export --output` no longer descends into `seek-index/`.
+- Added: `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek
+  indexes of segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and
+  `archive` remove a segment's index after the segment. Without a `seek-index/` directory this is one failed `open`
+  each.
 - Added: `Reader::seek_to_end` (C `tickertape_reader_seek_to_end`, C++ and Python `seek_to_end`, Java `seekToEnd`)
   places a reader at the end of the journal, reading at most the newest segment, from the checkpoint on. A file named
   like a segment without a valid header where the call starts (for a visible reader the newest name, even an empty or
@@ -275,8 +276,8 @@ describes what is released.
   passed, or an earlier one, scans the segment, and so does a new reader. All bindings get this through the Rust reader.
 - Changed: `inspect::read_checkpoint` (and so each refresh of a durable-only reader) reads the marker's two 64-byte
   slots instead of the whole 128 KiB file.
-- Changed (CLI): `tail --from-end` uses `Reader::seek_to_end`, so it no longer reads every retained segment, and damaged records in an
-  older segment no longer make it fail (a damaged header of the oldest segment still does).
+- Changed (CLI): `tail --from-end` uses `Reader::seek_to_end`, so it no longer reads every retained segment, and damaged
+  records in an older segment no longer make it fail (a damaged header of the oldest segment still does).
 - Changed (Python decoder): `read_journal(start_seq=...)` in `python/tickertape_reader.py` starts at the segment that
   holds `start_seq`, chosen by file name as the Rust reader does, instead of reading every segment from the oldest. It
   still validates that segment's records before `start_seq`; damage in earlier segments is no longer reported.
@@ -372,19 +373,20 @@ describes what is released.
   that the recorded seeks to the last record cross about half a segment. The "Not measured" list of v0.1.0 says what was
   measured later. ADRs 0025 and 0042 have notes.
 - Docs: `docs/operations.md` describes how to move a tape to another machine.
-- Docs: `docs/benchmarks.md` → "2026-11-27, release 1.1.0 against 1.0.0" has the release checklist's two checks
-  against 1.0.0 (x86-64 and aarch64 cloud VMs, 10 interleaved rounds with a second copy of 1.0.0 as the noise floor).
-  Append path: the writer's p50, p99 and p99.9 are lower, the durable-only reader's CPU and context switches fall by two
-  orders of magnitude (ADR 0053), and the writer's maximum, a roll, is higher (ADR 0058, above). Replay: level at
-  1,024 B; at 64 B about 1 % slower on aarch64 for both readers and 0.9 % for the safe reader on x86-64, which is not
+- Docs: `docs/benchmarks.md` → "2026-11-27, release 1.1.0 against 1.0.0" has the release checklist's two checks against
+  1.0.0 (x86-64 and aarch64 cloud VMs, 10 interleaved rounds with a second copy of 1.0.0 as the noise floor). Append
+  path: the writer's p50, p99 and p99.9 are lower, the durable-only reader's CPU and context switches fall by two orders
+  of magnitude (ADR 0053), and the writer's maximum, a roll, is higher (consistent with ADR 0058, above). Replay: level
+  at 1,024 B; at 64 B about 1 % slower on aarch64 for both readers and 0.9 % for the safe reader on x86-64, which is not
   explained.
 
 ### Benchmarks, tests and tooling
 
 - Added (benchmarks): `tt-faults` counts the page faults of the writer's thread append by append, with paced appends,
   background checkpoints and a zero-copy reader, and `benches/diagnostics/writer-faults.bt` classifies them (ADR 0058,
-  issue #60, proposed). The library does not change; the experiment switches the measurements used are on the branch
-  `exp/prefault-residual`, which is never merged.
+  issue #60; its change 1 is accepted and the default from 1.1, its change 2 is still proposed). The library does not
+  change; the experiment switches the measurements used are on the branch `exp/prefault-residual`, which is never
+  merged.
 - Added (benchmarks): `benches/diagnostics/profile-sustained.sh` profiles the threads of a sustained run or counts their
   system calls and heap allocations; `tt-sustained` has `--encode` (how payloads are made) and the reader option
   `owned`. `tests/allocation.rs` checks that appending, following and replaying allocate nothing per record.

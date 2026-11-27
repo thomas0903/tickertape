@@ -216,6 +216,10 @@ had storage errors with the 1.1 CLI: `tickertape status` predicts the refusal de
   where they exited 0. The error comes in the call that meets the first empty slot after an open or a seek, otherwise
   after at most 100 ms at the slot (1.1 s if only a later segment shows it) plus 50 ms. A program that treats
   `Error::Corrupt` as fatal can stop at damage it did not see before: find it with `tickertape verify`.
+- **After a repair in place** (ADR 0050), a visible reader whose position falls inside a record of the new history
+  gets `Error::Discarded` where 1.0.0 waited until it was seeked: seek it, as after any discarded history.
+- **Idle readers do more I/O** (ADR 0050): a reader waiting at an empty slot reads the marker ten times a second and
+  lists the segments at most once a second, when the directory has changed. Nothing to do.
 - **A blocking durable-only reader is woken by checkpoints** (ADR 0053). Appends no longer make a wake-up system call
   for it. When the writer's helper threads share its CPU, the last records of a large backlog can reach it up to about
   2 ms later than a reader that polls the marker: keep them on other CPUs (`WriterConfig::helper_cpus`).
@@ -242,6 +246,12 @@ had storage errors with the 1.1 CLI: `tickertape status` predicts the refusal de
   `tickertape verify` to find it. A segment missing in the middle of the chain during a removal is
   `Error::Corrupt` (`BrokenChain`) where it could be an `Error::Io`. Do not put segment files back into a journal
   while retention runs on it.
+- **Retention with `max_bytes`** (ADR 0051): a file as long as the one before it counts with its length, also if its
+  header names another size, where 1.0.0 failed the run.
+- **`retention::apply` and the marker** (ADR 0051): an I/O error reading the marker is returned even when another
+  archiver has just removed that segment.
+- **`tail --from-end`** reads only the newest segment from the checkpoint on (`Reader::seek_to_end`), so damaged
+  records in an older segment no longer make it fail (a damaged header of the oldest segment still does).
 - **`Reader` is 16-byte aligned** (ADR 0057). Its layout is `#[repr(C, align(16))]` and it is 464 bytes instead of
   456, so a `#[repr(packed)]` struct can no longer contain a `Reader` (a compile error; `cargo semver-checks` reports
   `repr_align_added`). Nothing else changes for callers.
@@ -291,8 +301,9 @@ under the owner's delegation, 2026-11-20). A program using a binding can compute
 has its sampling time, the head's next sequence number, the segments' total bytes and the storage headroom) and
 compare them with its own thresholds; any of the three can be added to the C ABI and the bindings in 1.x.
 
-1. The C ABI at 1.0: done in the 1.0.0 release preparation. `TICKERTAPE_ABI_VERSION` is 1 and the ABI baseline
-   (`crates/tickertape-ffi/abi/tickertape-baseline.h`) is the header shipped in 1.0.0, with 177 frozen declarations
+1. The C ABI at 1.0: done in the 1.0.0 release preparation. `TICKERTAPE_ABI_VERSION` is 1, and 1.0.0 froze 177
+   declarations in the ABI baseline (`crates/tickertape-ffi/abi/tickertape-baseline.h`), which now holds the 181 of
+   the 1.1.0 header, those 177 included
    (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
 2. The 1.0 fixtures: added on 2026-11-23, written by the released version on macOS and Linux aarch64
    (`docs/playbooks/release-checklist.md`, ADR 0033), as for every release.
