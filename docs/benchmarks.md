@@ -1101,10 +1101,16 @@ has no durability**: its rows are a ceiling, not a mode to recommend.
 Chronicle's published p50 and the tails are not. Open-source Chronicle Queue had p50 0.456 µs on the x86-64 VM on tmpfs
 (0.395 on aarch64) against the published 0.241. Its p99.9 was 1.61 µs (2.69) against 0.331, and its p99.999 30.2 µs
 (12.7) against 0.521. tickertape's zero-copy reader had p50 0.340 µs (0.264), the lowest median we measured, and p99
-0.527 µs on ext4 (0.428). Its p99.99 was 388 µs (461), where each of the run's ~13 segment rolls delays a few dozen
-records. On tmpfs, tickertape with its Linux defaults is worse than on ext4, because without the spare segment every
-roll zeroes the next 128 MiB segment on the writer's thread (28 ms on x86-64). Measuring from the send start instead of
-the scheduled send removes a late sender's backlog. That lowers Chronicle's p99.9 from 4.26 to 1.61 µs on tmpfs and from
+0.527 µs on ext4 (0.428). From p99.9 up, open-source Chronicle Queue was lower than the zero-copy reader on both
+storages: on ext4, p99.9 1.59 against 3.31 µs and p99.99 3.62 against 388 µs (x86-64; 1.73 against 2.18 and 4.65
+against 461 on aarch64). The zero-copy reader's p99.99 and maximum on ext4 are probably its own pauses at the run's ~13
+segment rolls (below). tickertape's safe reader, the API without `unsafe`, had a median of 0.752–1.04 µs from the send
+start, 1.7–2.6 times open-source Chronicle's 0.395–0.456. On tmpfs, tickertape with its Linux defaults is worse than
+on ext4. Without the spare segment every roll zeroes the next 128 MiB segment on the writer's thread. That explains the
+maxima (31.6 ms on x86-64, 26.0 ms on aarch64) and the tail from the scheduled send. It does not explain the zero-copy
+reader's 1.65–4.66 ms from the send start between p99.7 and p99.999 on tmpfs. Their cause has not been found, and
+the same was seen with the spare segment on (2026-11-26). Measuring from the send start instead of the scheduled send
+removes a late sender's backlog. That lowers Chronicle's p99.9 from 4.26 to 1.61 µs on tmpfs and from
 20.8 to 1.59 µs on ext4 (x86-64). tmpfs against ext4 changes Chronicle's latency from the send start by no consistent
 amount. Our data cannot say how much of the remaining distance to the published row comes from the machine and how much
 from the edition and the set-up.
@@ -1139,24 +1145,46 @@ Each run is one writer process and one reader process. 6,100,000 records are due
 The first 100,000 (1 s) stay out of the histograms, and **6,000,000 are measured in every run**, so the 99.999th
 percentile is the 60th-highest sample. A send is never skipped: one that starts late still runs. Late sends start more
 than 1 µs after their time. Raw results (every run's JSON, `children.log`, `commands.txt`, JVM logs, the machine
-description) are in `~/tmp/tt-gcp/cq/{x86,arm}-archive/cq-results.tgz` (sha256 `2288b9af…` and `40ed25b9…`), not in
-the repository. All 65 runs passed the runner's checks: every record was received in order, and latency from the send
+description) are kept outside the repository, one archive per machine (sha256 `2288b9af…` and `40ed25b9…`). All 65 runs passed the runner's checks: every record was received in order, and latency from the send
 start was nowhere above latency from the scheduled send. No run was repeated or left out.
+
+**The harness code changed after these runs, in two respects.** The runs used the first version of the option. In that
+version the adapters' loops tested the option at run time on every record, also when it was off; the version merged
+compiles the off path out (`compare/README.md`). The Chronicle and Aeron readers also read the send start from the
+record before the clock read; the merged version reads it after the clock read, as the Rust readers already did. The
+first difference concerns only runs with the option off, and every run here had it on. The second added one 8-byte
+load from a record line the reader had just read to both of Chronicle's histograms, before the clock read. It was not
+measured separately: it is a few nanoseconds at most, counted against Chronicle.
+
+**Late sends and the writer's lateness count all 6,100,000 sends**, including the first 100,000 that the histograms leave
+out. That is the late-sends column of every table here and the maximum lateness quoted below. Chronicle's writer logs
+every late episode of 10 µs or more, and in 22 of its 25 runs the largest lateness of the run (0.62–1.06 ms) was its
+first send after open, sequence 0, in the unmeasured first second. In the measured part (sequence 100,000 and later) its
+largest late episodes were 0.19–0.33 ms on x86-64 and 0.18–0.20 ms on aarch64. Most of them came at the 1 GiB chunk
+boundary (sequence 3,889,775), at sequence 4,194,305 or at 2,097,153. Four aarch64 ext4 runs also had one of 0.80–1.36
+ms at sequences 6.06–6.10 million, in the last 0.4 s. 163–2,009 of Chronicle's late sends per run fell in the first
+100,000. tickertape's adapter keeps no per-send log, so where its writer's maximum lateness fell is not known.
 
 **The two timer starts.** *From the scheduled send* is the harness's usual measure (`now − due`). It includes a late
 sender's backlog: when one send stalls, every record behind it starts late and is counted as late by the time it has
 waited. *From the send start* begins at the writer's clock read that ends its busy-wait. That is the same read the
 writer uses to count late sends, taken just before the record is encoded and handed to the tool. It excludes the
-backlog and includes the send (encoding, the tool's append, a roll or chunk change inside it) and the read. Both end at
-the same clock read of the reader, after it has validated the record's sequence and length. The clock is the wall clock
-(`Instant.now()` in Java, `CLOCK_REALTIME` in Rust), read the same way in both tools. Chronicle's "write-to-read" is
+backlog and includes the send (encoding, the tool's append, a roll or chunk change inside it) and the read. With the
+JVM logs on (the default), the Java writer also logs a late send between that clock read and the send, which counts
+against Chronicle; it does so only for late sends. Both measures end at the same clock read of the reader, after the
+record has been read and its sequence and length checked. The reads are not the same work. tickertape's readers check
+the record's CRC32C over the whole record before they return it, and the safe reader also copies it into its buffer.
+Chronicle's adapter checks no checksum: it reads the sequence and the timestamp in place and touches the last payload
+byte. The clock is the wall clock (`Instant.now()` in Java, `CLOCK_REALTIME` in Rust). Chronicle's "write-to-read" is
 closer to the second measure, but the page does not say where its timer starts.
 
 ### Chronicle's published row beside ours: latency from the send start (µs)
 
 µs throughout, so 0.241 is 241 ns. Medians of five runs; the min–max of the runs is in the tables after this one.
 **The first row is Chronicle Software's published figure for their commercial Rust queue on a Ryzen 9 7950X, with a
-set-up the page does not describe. We did not measure it.**
+set-up the page does not describe. We did not measure it.** The figures from the send start are not corrected for
+coordinated omission: they leave a late sender's backlog out by construction. The tables from the scheduled send below
+are the measure that includes it.
 
 | Source | Machine | Storage | Tool | Reader / blockSize | p50 | p90 | p97 | p99 | p99.7 | p99.9 | p99.97 | p99.99 | p99.997 | p99.999 | max |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -1244,11 +1272,14 @@ From the send start:
 
 - **The timer start.** For Chronicle the start accounts for most of the tail between p97 and p99.99. On x86-64 tmpfs
   p99 falls from 2.55 to 0.718 µs, p99.9 from 4.26 to 1.61 and p99.99 from 30.3 to 3.82. On ext4 p99.9 falls from 20.8
-  to 1.59. Chronicle's writer was late in 0.7–1.1 % of sends (41,531–65,820 per run in medians), by up to 0.6–1.4 ms,
-  and every late send makes the records behind it late. For tickertape's zero-copy reader the start moves p50 by about
-  65 ns (0.407 to 0.340 µs on x86-64) and p99 from 0.900 to 0.527 on ext4, and leaves p99.99 where it is (388 µs): that
-  tail happens inside the send and read, not before them. Fewer of tickertape's sends were late on ext4 (14,671 per run
-  on x86-64, 6,125 on aarch64, medians).
+  to 1.59. Chronicle's writer was late in 0.7–1.1 % of all sends (medians of 41,531–65,820 per run). In the measured
+  part no send started more than 0.18–0.33 ms late (0.80–1.36 ms in four aarch64 ext4 runs; above), and every late
+  send makes the records behind it late. For tickertape's zero-copy reader the start moves p50 by about 65 ns (0.407 to
+  0.340 µs on x86-64) and p99 from 0.900 to 0.527 on ext4, and leaves p99.99 where it is (388 µs): that tail happens
+  inside the send and read, not before them. With the zero-copy reader fewer of tickertape's sends were late than
+  Chronicle's on ext4 (medians 14,671 per run on x86-64 and 6,125 on aarch64). With the safe reader, on the same writer
+  and settings, more were late on x86-64 (73,286 against Chronicle's 41,531) and fewer on aarch64 (39,715 against
+  57,798).
 - **tmpfs against ext4.** Measured from the send start, Chronicle's rows on the two storages are within each other's
   run ranges or close to them. x86-64 p99.9 was 1.61 against 1.59 µs and p99.99 3.82 against 3.62. On aarch64 p99.9 was
   2.69 against 1.73, p99.99 4.87 against 4.65 and p99.999 12.7 against 17.3. Measured from the scheduled send, ext4
@@ -1269,8 +1300,12 @@ From the send start:
   11 s, which fit in one tickertape segment and one Chronicle 1 GiB chunk. A 61 s run at 256 B rolls about 13
   tickertape segments and crosses one 1 GiB chunk boundary (or about six 256 MiB ones). tickertape's W2 in the rerun ran
   through `tt-latency`, not the adapter used here. So the medians grew by about 0.1 µs (tickertape) and 0 to 0.06 µs
-  (Chronicle) with the larger record. The maxima and tickertape's p99.99 here come from rolls the rerun's W2 never
-  reached, not from the payload.
+  (Chronicle) with the larger record. tickertape's p99.99 and maximum here are probably the zero-copy reader's pauses
+  at rolls, which the rerun's W2 never reached, rather than the payload. The arithmetic fits: 296 B frames × 6.1
+  million records is about 13.4 rolls, and the 600 records above p99.99 are about 46 per roll. The data puts it on the
+  reader's side. On x86-64 ext4 the writer was never more than 0.17–0.20 ms late, while the maximum from the send start
+  was 0.91–1.04 ms. The safe reader behind the same writer had p99.99 17.8 µs (4.91 on aarch64). No per-record timing
+  ties those samples to the rolls.
 - **The block size.** On x86-64 tmpfs Chronicle with 256 MiB chunks had a lower p50 than with 1 GiB (0.448 against
   0.456 µs from the send start) and a higher tail: p99 1.36 against 0.718, p99.997 51.5 against 7.75 and p99.999 105
   against 30.2. Those runs cross about five more chunk boundaries.

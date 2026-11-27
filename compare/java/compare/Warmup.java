@@ -95,7 +95,7 @@ final class Warmup {
             CountDownLatch stop=new CountDownLatch(1);
             Task drain=!writer.needsPeer() ? null : new Task("warmup-drain",()-> {
                 try (Harness.Endpoint reader=factory.open("reader",scratch)) {
-                    Harness.Observer ignore=(seq,ts,sent,len)-> { };
+                    Harness.Observer ignore=(seq,ts,len)-> { };
                     // A pause every 100 ms, so that the writer has met back pressure before the measurement does.
                     long pause=System.nanoTime();
                     while (stop.getCount()>0) {

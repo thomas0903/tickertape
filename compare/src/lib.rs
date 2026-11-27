@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
@@ -78,6 +79,11 @@ fn validate(data: &[u8], expected: u64, payload: usize) -> Result<u64> {
     std::hint::black_box(&data[16..]);
     Ok(u64::from_le_bytes(data[8..16].try_into()?))
 }
+
+/// With `--send-start on`, the reader's clock read of the last measured record, for the histogram from the send start
+/// (0: the record was not measured). A static, not a local, so that `observe` captures nothing more in `run::<false>`;
+/// only the reader thread uses it.
+static LAST_READ: AtomicU64 = AtomicU64::new(0);
 
 /// The send start that a writer with `--send-start on` stored in the first 8 application bytes.
 fn send_start(application: &[u8]) -> Result<u64> {
@@ -235,7 +241,9 @@ struct Target {
     control: Option<PathBuf>,
 }
 impl Target {
-    /// Called when no record was available: reads `writer.done` once it exists.
+    /// Called when no record was available: reads `writer.done` once it exists. Inlined into the reader's loop, as the
+    /// compiler did when `run` had one instantiation; with two it would call it.
+    #[inline(always)]
     fn idle(&mut self) -> Result<()> {
         let Some(control) = self.control.as_ref().filter(|_| self.probe && !self.known) else {
             return Ok(());
@@ -248,8 +256,10 @@ impl Target {
     }
 }
 
-fn run(tool: &str) -> Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+/// `STAMP` is `--send-start on`. It is a const parameter so that `run::<false>`, the default, is the loops' previous
+/// code with the option's blocks compiled out (`if STAMP` on a constant); `main_for` chooses the instantiation once.
+/// `args` are the process's arguments without the program name.
+fn run<const STAMP: bool>(tool: &str, args: Vec<String>) -> Result<()> {
     let role = args.first().ok_or("expected writer or reader")?;
     if role != "writer" && role != "reader" {
         return Err("expected writer or reader".into());
@@ -294,14 +304,15 @@ fn run(tool: &str) -> Result<()> {
     if count == 0 || rate == 0 || warmup >= count || !PAYLOADS.contains(&payload) {
         return Err("invalid count/rate/warmup/payload".into());
     }
-    // --send-start on: the writer also stores the send start (the clock read that ends its busy-wait, which it takes
-    // anyway to count late sends) in the first 8 application bytes, and the reader records a second histogram from it
-    // with the same clock read as the first. Live modes only; off by default.
-    let stamp_send = match opts.optional("--send-start") {
-        None | Some("off") => false,
-        Some("on") if live => true,
-        _ => return Err("--send-start takes on or off and needs a live mode".into()),
-    };
+    // --send-start on (`STAMP`): the writer also stores the send start (the clock read that ends its busy-wait, which
+    // it takes anyway to count late sends) in the first 8 application bytes, and the reader records a second histogram
+    // from it after the clock read of the first. Live modes only; off by default.
+    if STAMP != (opts.optional("--send-start") == Some("on"))
+        || !matches!(opts.optional("--send-start"), None | Some("on" | "off"))
+        || (STAMP && !live)
+    {
+        return Err("--send-start takes on or off and needs a live mode".into());
+    }
     let control = opts.path("--control");
     let helper_cpus = opts
         .optional("--helper-cpus")
@@ -365,7 +376,6 @@ fn run(tool: &str) -> Result<()> {
         let mut sync_overruns = 0u64;
         let mut next_sync = sync_every.map(|every| Instant::now() + every);
         let mut sent = 0;
-        let mut sent_at = 0;
         let mut stopped_by = "count";
         if probe {
             while clock::realtime_ns() < t0 {
@@ -384,18 +394,25 @@ fn run(tool: &str) -> Result<()> {
                     stopped_by = "duration";
                     break;
                 }
+                if STAMP {
+                    bytes[offset + 16..offset + 24].copy_from_slice(&now.to_le_bytes());
+                }
                 now
             } else if live {
                 let intended = intended_ns(t0, i, rate)?;
                 while clock::realtime_ns() < intended {
                     std::hint::spin_loop();
                 }
-                sent_at = clock::realtime_ns();
-                let delay = sent_at - intended;
+                let delay = clock::realtime_ns() - intended;
                 if delay > 1000 {
                     late += 1;
                 }
                 max_late = max_late.max(delay);
+                if STAMP {
+                    // The send start is the clock read of `delay`.
+                    let at = intended + delay;
+                    bytes[offset + 16..offset + 24].copy_from_slice(&at.to_le_bytes());
+                }
                 intended
             } else {
                 0
@@ -403,11 +420,6 @@ fn run(tool: &str) -> Result<()> {
             start.get_or_insert_with(Instant::now);
             bytes[offset..offset + 8].copy_from_slice(&(priming + i).to_le_bytes());
             bytes[offset + 8..offset + 16].copy_from_slice(&intended.to_le_bytes());
-            if stamp_send {
-                // A probe's timestamp is its send start already.
-                let at = if probe { intended } else { sent_at };
-                bytes[offset + 16..offset + 24].copy_from_slice(&at.to_le_bytes());
-            }
             // Plain file's prefix is passed only to write(2), not other tools.
             sink.send(intended, &bytes)?;
             sent += 1;
@@ -451,7 +463,12 @@ fn run(tool: &str) -> Result<()> {
         return Ok(());
     }
     let mut hist = Histogram::<u64>::new(3)?;
-    let mut from_send = Histogram::<u64>::new(3)?;
+    // --send-start: the histogram from the send start; it does not exist without the option.
+    let mut from_send = if STAMP {
+        Some(Histogram::<u64>::new(3)?)
+    } else {
+        None
+    };
     let start = Instant::now(); // Includes fresh reader opening for W3.
     // A probe's count is only a disk cap: its deadline follows the duration instead.
     let deadline = start
@@ -468,22 +485,39 @@ fn run(tool: &str) -> Result<()> {
         known: !probe,
         control: control.clone(),
     };
-    // `application` is the record's application payload; only --send-start reads it.
-    let mut observe = |seq: u64, ts: u64, application: &[u8]| -> Result<()> {
-        if seq != expected || application.len() != payload {
+    let mut observe = |seq: u64, ts: u64, len: usize| -> Result<()> {
+        if seq != expected || len != payload {
             return Err("record sequence or length mismatch".into());
         }
         if live && expected >= warmup {
-            let now = clock::realtime_ns();
-            hist.record(now.checked_sub(ts).ok_or("wall clock moved backwards")?)?;
-            if stamp_send {
-                from_send.record(
-                    now.checked_sub(send_start(application)?)
+            if STAMP {
+                let now = clock::realtime_ns();
+                hist.record(now.checked_sub(ts).ok_or("wall clock moved backwards")?)?;
+                LAST_READ.store(now, Ordering::Relaxed);
+            } else {
+                hist.record(
+                    clock::realtime_ns()
+                        .checked_sub(ts)
                         .ok_or("wall clock moved backwards")?,
                 )?;
             }
         }
         expected += 1;
+        Ok(())
+    };
+    // After `observe`, with the record's application bytes: from the send start to the clock read `observe` took.
+    let mut observe_sent = |application: &[u8]| -> Result<()> {
+        let Some(from_send) = from_send.as_mut() else {
+            return Ok(());
+        };
+        let now = LAST_READ.load(Ordering::Relaxed);
+        LAST_READ.store(0, Ordering::Relaxed);
+        if now != 0 {
+            from_send.record(
+                now.checked_sub(send_start(application)?)
+                    .ok_or("wall clock moved backwards")?,
+            )?;
+        }
         Ok(())
     };
     let ready = || -> Result<()> {
@@ -516,7 +550,10 @@ fn run(tool: &str) -> Result<()> {
             while received < target.count {
                 if let Some(record) = r.try_next()? {
                     std::hint::black_box(record.payload);
-                    observe(record.seq, record.local_ts_ns, record.payload)?;
+                    observe(record.seq, record.local_ts_ns, record.payload.len())?;
+                    if STAMP {
+                        observe_sent(record.payload)?;
+                    }
                     received += 1;
                 } else {
                     idle(&mut target)?;
@@ -533,7 +570,14 @@ fn run(tool: &str) -> Result<()> {
             ready()?;
             while received < target.count {
                 if let Some(bytes) = r.poll()? {
-                    observe(received, validate(bytes, received, payload)?, &bytes[16..])?;
+                    observe(
+                        received,
+                        validate(bytes, received, payload)?,
+                        bytes.len() - 16,
+                    )?;
+                    if STAMP {
+                        observe_sent(&bytes[16..])?;
+                    }
                     received += 1;
                 } else {
                     idle(&mut target)?;
@@ -553,8 +597,11 @@ fn run(tool: &str) -> Result<()> {
                         observe(
                             received,
                             validate(&record, received, payload)?,
-                            &record[16..],
+                            record.len() - 16,
                         )?;
+                        if STAMP {
+                            observe_sent(&record[16..])?;
+                        }
                         record.commit()?;
                         received += 1;
                     }
@@ -572,7 +619,7 @@ fn run(tool: &str) -> Result<()> {
                 observe(
                     i as u64,
                     validate(&record, i as u64, payload)?,
-                    &record[16..],
+                    record.len() - 16,
                 )?;
                 received += 1;
             }
@@ -586,7 +633,7 @@ fn run(tool: &str) -> Result<()> {
             let mut iter = r.iter();
             for i in 0..count {
                 let bytes = iter.borrowed_next().ok_or("truncated queue")?;
-                observe(i, validate(bytes, i, payload)?, &bytes[16..])?;
+                observe(i, validate(bytes, i, payload)?, bytes.len() - 16)?;
                 received += 1;
             }
             (start.elapsed().as_secs_f64(), read_back()?)
@@ -601,8 +648,8 @@ fn run(tool: &str) -> Result<()> {
         json!({"count": read, "latency_from": "send start", "latency": histogram_json(&hist)})
     } else if live {
         let mut result = live_histogram(&hist);
-        if stamp_send {
-            result["from_send_start"] = live_histogram(&from_send);
+        if let Some(from_send) = &from_send {
+            result["from_send_start"] = live_histogram(from_send);
         }
         result
     } else {
@@ -624,7 +671,17 @@ fn timer_starts(mode: &str) -> &'static str {
 }
 
 pub fn main_for(tool: &str) {
-    if let Err(e) = run(tool) {
+    // The instantiation is chosen once, before anything runs; `run` checks the option itself.
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let stamp = args
+        .windows(2)
+        .any(|w| w[0] == "--send-start" && w[1] == "on");
+    let result = if stamp {
+        run::<true>(tool, args)
+    } else {
+        run::<false>(tool, args)
+    };
+    if let Err(e) = result {
         eprintln!("{tool}: {e}");
         std::process::exit(1);
     }

@@ -175,14 +175,30 @@ safe,mapped` (default mapped; `tt-sustained` covers both readers in depth), `--k
 
 **Latency from the send start (`--send-start-latency`, off by default).** In the paced runs (SV, SD) every writer
 also stores its send start in the first 8 application bytes, and the reader records a second histogram from it,
-`reader_result.from_send_start`, beside the usual one from the scheduled send. The send start is the clock read that ends
-the writer's busy-wait, which every writer takes anyway to count late sends (Rust `realtime_ns()`, Java `Instant.now()`,
-the same place in both loops), so the option adds no clock read: the writer does one more 8-byte store into its record
-buffer, and the reader one more 8-byte load from the record and one more histogram record, after the clock read that
-both histograms use. Each record's latency from its send start is its latency from the scheduled send minus the
-writer's delay, so it excludes a late sender's backlog; it still includes the send itself (encoding, the tool's append,
-a roll or chunk change) and the read. The runner rejects a run in which it is above the latency from the scheduled send
-at any percentile. Without the option nothing is stored or read. The unpaced probe stores the send start already.
+`reader_result.from_send_start`, beside the usual one from the scheduled send. The send start is the clock read that
+ends the writer's busy-wait, which every writer takes anyway to count late sends (Rust `realtime_ns()`, Java
+`Instant.now()`), so the option adds no clock read. With it on, the writer does one more 8-byte store into its record
+buffer. The reader, after the clock read that both histograms use, does one more 8-byte load from the record and one
+more histogram record: the Rust readers and the Java `Observer.sent`, which the Chronicle and Aeron adapters call right
+after `Observer.record`. Where the two languages differ: with `--events` (the JVM logs, on by default) the Java writer
+logs a late send between its clock read and the send, so on late sends that logging is inside Chronicle's and Aeron's
+latency from the send start. Each record's latency from its send start is its latency from the scheduled send minus the
+writer's delay, so it excludes a late sender's backlog: it is **not corrected for coordinated omission**, and results
+say so in `coordinated_omission_from_send_start`. It still includes the send itself (encoding, the tool's append, a
+roll or chunk change) and the read. The runner rejects a run in which it is above the latency from the scheduled send
+at any percentile. The unpaced probe stores the send start already.
+
+**With the option off the loops are the code they were before it.** In Rust, `run` has a const parameter
+(`run::<false>`, chosen once in `main_for`), and every piece of the option is in an `if STAMP` block or outside the
+loops (the second histogram is an `Option` that stays `None`; the reader's last clock read is a static). The compiled
+`run::<false>` and its closures were compared instruction by instruction (aarch64 assembly) with a copy of the source
+from which every line of the option had been deleted, and were identical. That copy differs from the code before the
+option only outside the loops: the accepted payloads, the option check, the result's `percentiles_us`, the arguments
+collected in `main_for`, and `#[inline(always)]` on `Target::idle`, which the compiler inlined anyway with one
+instantiation. In Java the option is `Harness.SendStart.ON`, a `static final` field of a holder class that is
+initialised once the options are parsed. HotSpot's compilers treat a static final field of an initialised class as a
+constant, so the loops' `if (SendStart.ON)` blocks are compiled out. `Observer.record` keeps its signature, and
+`Receiver` has two more fields (`fromSend`, null without the option, and `lastWall`).
 
 **Percentile ladder.** The live readers' histograms of the adapters in this directory (SV, SD, and W2 except
 tickertape's, which `tt-latency` measures) also carry `percentiles_us`: 50, 90, 97, 99, 99.7,

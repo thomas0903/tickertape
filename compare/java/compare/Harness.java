@@ -11,9 +11,19 @@ import java.util.*;
 /** Shared roles and schedule. Receive implementations call Observer after validating
  * framing; no payload copy is required by the common measurement interface. */
 public final class Harness {
-    /** sendStart is the send start a writer with --send-start on stored in the first 8 application bytes; endpoints
-     * pass 0 without it (sendStartRequested()). */
-    public interface Observer { void record(long seq, long intended, long sendStart, int payload); }
+    public interface Observer {
+        void record(long seq, long intended, int payload);
+        /** --send-start on only ({@link SendStart#ON}), right after {@link #record} of the same record: the send start
+         * the writer stored in the first 8 application bytes. Endpoints load it after record, so after its clock read. */
+        default void sent(long sendStart) { }
+    }
+    /** --send-start on. A static final field of a class initialised once the options are parsed (run() reads it there
+     * and checks it): HotSpot treats static finals of initialised classes as constants, so with the option off the
+     * loops' `if (SendStart.ON)` blocks are compiled out and the loops are the code they were before the option. */
+    public static final class SendStart {
+        public static final boolean ON = options.getOrDefault("--send-start","off").equals("on");
+        private SendStart() { }
+    }
     public interface Endpoint extends AutoCloseable {
         default void send(byte[] bytes) throws Exception { throw new UnsupportedOperationException(); }
         default boolean poll(Observer observer) throws Exception { throw new UnsupportedOperationException(); }
@@ -46,9 +56,6 @@ public final class Harness {
     /** Percentiles of the live reader's percentiles_us (compare/src/lib.rs has the same list). */
     static final double[] LADDER = {50, 90, 97, 99, 99.7, 99.9, 99.97, 99.99, 99.997, 99.999};
     static final String[] LADDER_NAMES = {"50","90","97","99","99.7","99.9","99.97","99.99","99.997","99.999"};
-    /** --send-start on: the writer stores its send start in the first 8 application bytes and the reader records a
-     * second histogram from it. Endpoints read it into a final field when they open. */
-    public static boolean sendStartRequested() { return options.getOrDefault("--send-start","off").equals("on"); }
     static volatile boolean live = false;
     public enum Phase { MEASURED, FULL_WARMUP, FRESH_WARMUP }
     /** What endpoints are opened for now; the long warm-up opens scratch endpoints of its own. */
@@ -135,7 +142,7 @@ public final class Harness {
     /** The writer's loop. The long warm-up runs the same object code on scratch endpoints. */
     static final class Sender {
         final Endpoint endpoint; final byte[] data; final ByteBuffer buffer;
-        final boolean live, probe, stampSend=sendStartRequested(); final long rate, durationNs, syncEveryNs;
+        final boolean live, probe; final long rate, durationNs, syncEveryNs;
         final Histogram syncHist=new Histogram(3);
         final Episodes episodes=episodes();
         long t0, seqBase, start, sent, late, maxLate, nextSync, syncOverruns;
@@ -149,23 +156,22 @@ public final class Harness {
         /** Sends records from..to; false once a probe's duration has passed. */
         boolean send(long from, long to) throws Exception {
             for (long i=from;i<to;i++) {
-                long intended, sentAt=0;
+                long intended;
                 if (probe) {
                     // An unpaced probe stores the actual send start, so reader latency is from the send.
                     intended=now();
-                    sentAt=intended;
                     if (i>0 && System.nanoTime()-start>=durationNs) { stoppedBy="duration"; return false; }
+                    if (SendStart.ON) buffer.putLong(16,intended);
                 } else if (live) {
                     intended=Math.addExact(t0, Math.multiplyExact(i,1_000_000_000L)/rate);
                     while (now()<intended) { endpoint.idle(); Thread.onSpinWait(); }
                     long wall=now(), delay=wall-intended;
-                    sentAt=wall;
+                    if (SendStart.ON) buffer.putLong(16,wall);
                     if (delay>LATE_NS) { late++; if (episodes!=null) episodes.over(i,wall,delay); }
                     else if (episodes!=null) episodes.open=false;
                     maxLate=Math.max(maxLate,delay);
                 } else intended=0;
                 buffer.putLong(0,seqBase+i); buffer.putLong(8,intended);
-                if (stampSend) buffer.putLong(16,sentAt);
                 endpoint.send(data);
                 sent++;
                 if (syncEveryNs>0) {
@@ -186,27 +192,30 @@ public final class Harness {
     /** The reader's per-record check and histogram. */
     static final class Receiver implements Observer {
         final int payload; final boolean live; final long warmup; final Histogram hist;
-        /** From the send start (--send-start on), else null. */
-        final Histogram fromSend;
         final Episodes episodes=episodes();
-        long expected;
+        /** From the send start (--send-start on), else null; lastWall is the clock read of the last measured record. */
+        final Histogram fromSend;
+        long expected, lastWall;
         Receiver(int payload, boolean live, long warmup, Histogram hist) {
             this.payload=payload; this.live=live; this.warmup=warmup; this.hist=hist;
-            fromSend=live && sendStartRequested() ? new Histogram(3) : null;
+            fromSend=SendStart.ON && live ? new Histogram(3) : null;
         }
-        public void record(long seq, long ts, long sendStart, int len) {
+        public void record(long seq, long ts, int len) {
             if (seq!=expected || len!=payload) throw new IllegalStateException("record sequence/length mismatch");
             if (live && expected>=warmup) {
                 long wall=now(), latency=wall-ts;
                 if (latency<0) throw new IllegalStateException("wall clock moved backwards");
                 hist.recordValue(latency);
-                if (fromSend!=null) {
-                    if (wall<sendStart) throw new IllegalStateException("wall clock moved backwards");
-                    fromSend.recordValue(wall-sendStart);
-                }
+                if (SendStart.ON) lastWall=wall;
                 if (episodes!=null) { if (latency>SLOW_NS) episodes.over(seq,wall,latency); else episodes.open=false; }
             }
             expected++;
+        }
+        @Override public void sent(long sendStart) {
+            if (fromSend==null || lastWall==0) return;
+            if (lastWall<sendStart) throw new IllegalStateException("wall clock moved backwards");
+            fromSend.recordValue(lastWall-sendStart);
+            lastWall=0;
         }
     }
     /** The reader's loop, also used by the warm-up. */
@@ -303,6 +312,8 @@ public final class Harness {
             throw new IllegalArgumentException("invalid benchmark options");
         periodicSyncRequested = syncEveryNs>0;
         options = Map.copyOf(opts);
+        // Initialises SendStart now, from these options, before any loop or endpoint reads it.
+        if (SendStart.ON != sendStart.equals("on")) throw new IllegalStateException("SendStart initialised too early");
         boolean longWarmup = opts.getOrDefault("--warmup-mode","short").equals("long");
         long jitWarmup=Long.parseLong(opts.getOrDefault("--jit-warmup","100000"));
         Map<String,Object> warmupInfo = new LinkedHashMap<>();
@@ -336,7 +347,7 @@ public final class Harness {
             } else {
                 try (Endpoint warm=factory.open("reader",dir)) {
                     long[] read={0};
-                    Observer observer=(seq,ts,sent,len)->read[0]++;
+                    Observer observer=(seq,ts,len)->read[0]++;
                     long deadline=System.nanoTime()+TIMEOUT;
                     while (read[0]<Math.min(jitWarmup,count)) {
                         warm.poll(observer);

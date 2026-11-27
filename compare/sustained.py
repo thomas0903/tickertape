@@ -368,6 +368,11 @@ def run_attempt(run, params, out, env, commands):
         finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), data_dir=str(tmp_root),
         free_bytes_before=free,
         send_start_latency=bool(params.get("send_start_latency")) and run.workload != "probe",
+        # The histogram from the send start (reader_result.from_send_start) leaves a late sender's backlog out by
+        # construction; the one from the intended times is the measure that is free of coordinated omission.
+        coordinated_omission_from_send_start="from each record's send start: a late sender's backlog is excluded, "
+        "not corrected for coordinated omission" if params.get("send_start_latency") and run.workload != "probe"
+        else None,
         coordinated_omission="unpaced probe: latency from send start" if run.workload == "probe"
         else "intended timestamps; no skipped sends or rebasing")
     return result
