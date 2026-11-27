@@ -15,7 +15,7 @@ processes on the same machine follow them live or replay from any sequence numbe
 cargo add tickertape
 ```
 
-[API documentation](https://docs.rs/tickertape/1.0.0/tickertape/)
+[API documentation](https://docs.rs/tickertape/1.1.0/tickertape/)
 
 The `tickertape` CLI (crate `tickertape-cli`) tails, verifies and exports journals to JSONL or Parquet.
 See the [repository](https://github.com/thomas0903/tickertape) for the quickstart, examples and benchmarks.

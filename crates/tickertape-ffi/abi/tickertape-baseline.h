@@ -56,7 +56,7 @@
 /**
  * The minor version of the library this header belongs to.
  */
-#define TICKERTAPE_VERSION_MINOR 0
+#define TICKERTAPE_VERSION_MINOR 1
 
 /**
  * The patch version of the library this header belongs to.
@@ -261,14 +261,16 @@ enum tickertape_corrupt_reason
    */
   TICKERTAPE_CORRUPT_BROKEN_CHAIN = 12,
   /**
-   * The checkpoint marker points to a missing segment or an impossible offset.
+   * The checkpoint marker points to a missing segment, an impossible offset, or (from 1.1) a position its segment's
+   * records do not reach (`docs/format.md` → Recovery, step 2; ADR 0056).
    */
   TICKERTAPE_CORRUPT_DANGLING_CHECKPOINT = 13,
   /**
-   * A commit word reads 0, and recovery or verify found evidence of committed records after it (usually storage
-   * damage; a torn payload can also cause it: `docs/crash-contract.md` C1, C11; ADR 0035). The error message
-   * names the sequence number the evidence carries: a later valid record's, the next sequence number of a seal
-   * that ends the segment, or the base of a later segment.
+   * A commit word reads 0, and recovery, verify or (from 1.1) a reader found evidence of committed records after it
+   * (usually storage damage; a torn payload can also make recovery and verify report it: `docs/crash-contract.md`
+   * C1, C11; ADRs 0035 and 0050). The error message names the sequence number the evidence carries: a later valid
+   * record's, the next sequence number of a seal that ends the segment, the base of a later segment, or the sequence
+   * number the checkpoint marker covers up to.
    */
   TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD = 14,
   /**
@@ -448,6 +450,12 @@ enum tickertape_checkpoint_problem
    * The marker's offset is misaligned or outside its segment's record area.
    */
   TICKERTAPE_CHECKPOINT_INVALID_OFFSET = 3,
+  /**
+   * The records of the marker's segment do not reach the marker's position: the record right before its offset is
+   * missing, damaged, ends elsewhere or has another sequence number (or, at offset 64, `next_seq` is not the
+   * segment's base). Added in 1.1 (ADR 0056).
+   */
+  TICKERTAPE_CHECKPOINT_DANGLING = 4,
   /**
    * A problem this version of the C ABI does not name (not returned by a library built from one source tree).
    */
@@ -1642,29 +1650,31 @@ tickertape_status tickertape_writer_options_set_recovery_policy(struct tickertap
 tickertape_status tickertape_writer_options_set_notify(struct tickertape_writer_options *options, int32_t enabled);
 
 /**
- * Sets whether the writer does segment work (prefaulting pages, and on macOS preparing the next segment) in
- * background threads it starts. Zero gives a writer that starts no threads, except the checkpoint thread that
- * `tickertape_writer_request_checkpoint` starts; it also turns off early write-back
- * (`tickertape_writer_options_set_early_writeback`). Default: on.
+ * Sets whether the writer does segment work (prefaulting pages) in background threads it starts. Zero gives a writer
+ * that starts no threads, except the checkpoint thread that `tickertape_writer_request_checkpoint` starts; it also turns
+ * off early write-back (`tickertape_writer_options_set_early_writeback`) and the spare segment
+ * (`tickertape_writer_options_set_spare_segment`). Default: on.
  *
  * # Safety
  *
  * `options` must be NULL or live writer options, not used by another thread during the call.
  */
-tickertape_status tickertape_writer_options_set_prefault(struct tickertape_writer_options *options, int32_t enabled);
+tickertape_status tickertape_writer_options_set_prefault(struct tickertape_writer_options *options,
+                                                         int32_t enabled);
 
 /**
  * Sets whether the writer starts the kernel's write-back of the pages it has finished with as it goes, so that a
  * checkpoint finds little left to write (ADR 0038 → Early write-back). Non-zero enables it. Default: on.
  *
  * **Linux:** applies only with prefault on (`tickertape_writer_options_set_prefault`), the switch for the writer's
- * helper threads. A helper thread (`tickertape-writeback`) calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the
- * whole pages behind the write position each time it has moved 1 MiB, and over the rest of a segment when the writer
- * rolls past it. That call only starts writing: what is durable when is unchanged, and only a checkpoint promises it
- * (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint of this writer succeeds: the
- * error is returned once, by the next checkpoint, `tickertape_writer_request_checkpoint`,
- * `tickertape_writer_checkpoint_progress` or `tickertape_writer_close`, and `TICKERTAPE_E_DURABILITY_LOST` after
- * that. If the filesystem does not support the call, the helper stops. **macOS:** no effect.
+ * helper threads. A helper thread (`tickertape-writeback`) calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` each time
+ * the write position has moved 1 MiB, up to the 128 KiB boundary below it (not into the page-cache folio the writer is
+ * still filling; ADR 0058, from 1.1), and over the rest of a segment when the writer rolls past it. A checkpoint may
+ * therefore find up to 128 KiB more to write. That call only starts writing: what is durable when is unchanged, and
+ * only a checkpoint promises it (`docs/crash-contract.md`). If the call fails with an I/O error, no later checkpoint
+ * of this writer succeeds: the error is returned once, by the next checkpoint, `tickertape_writer_request_checkpoint`,
+ * `tickertape_writer_checkpoint_progress` or `tickertape_writer_close`, and `TICKERTAPE_E_DURABILITY_LOST` after that.
+ * If the filesystem does not support the call, the helper stops. **macOS:** no effect.
  *
  * # Safety
  *
@@ -1672,6 +1682,25 @@ tickertape_status tickertape_writer_options_set_prefault(struct tickertape_write
  */
 tickertape_status tickertape_writer_options_set_early_writeback(struct tickertape_writer_options *options,
                                                                 int32_t enabled);
+
+/**
+ * Sets whether the writer prepares the next segment in a background thread (`tickertape-spare`) once the active one is
+ * half full, so that a roll writes its header and links it instead of creating a file (ADR 0022; on Linux ADR 0049).
+ * Non-zero enables it. Default: on on macOS, **off on Linux**. Applies only with prefault on
+ * (`tickertape_writer_options_set_prefault`).
+ *
+ * It reserves one more segment's worth of disk space from the time the active segment is half full, and holds one more
+ * file descriptor and segment mapping. **Linux:** the thread lives as long as the writer; a roll that finds the
+ * segment not ready creates one itself, and waits for the prepared one only if that fails for lack of space; closing
+ * the writer waits for one being prepared. Whether it helps depends on the load and the disk: measure first (ADR
+ * 0049). Added in 1.1.
+ *
+ * # Safety
+ *
+ * `options` must be NULL or live writer options, not used by another thread during the call.
+ */
+tickertape_status tickertape_writer_options_set_spare_segment(struct tickertape_writer_options *options,
+                                                              int32_t enabled);
 
 /**
  * Sets where the writer's helper threads run: `placement` is a `tickertape_helper_cpus` value. With
@@ -1730,12 +1759,33 @@ void tickertape_reader_options_free(struct tickertape_reader_options *options);
  * Records it returns survive a power loss only under the crash contract's conditions: storage that honours the sync
  * calls, and no failed checkpoint earlier in the same boot (`docs/crash-contract.md`).
  *
+ * While it waits for a checkpoint it is woken by checkpoints, not by appends (ADR 0053; beside a 1.0.0 writer it polls
+ * the marker at the maximum sleep instead).
+ *
  * # Safety
  *
  * `options` must be NULL or live reader options, not used by another thread during the call.
  */
 tickertape_status tickertape_reader_options_set_durable_only(struct tickertape_reader_options *options,
                                                              int32_t enabled);
+
+/**
+ * Sets whether `tickertape_reader_seek` may start at a record named by a seek index, one of the optional files that
+ * `tickertape index` writes next to the journal (ADR 0045, crash contract C15). Non-zero enables it. Default: off.
+ *
+ * A seek into a sealed segment that has an index then validates the record it lands on and every record from there,
+ * instead of every record from the segment's start. Records before that are not read, so damage there no longer stops
+ * the reader. Without an index, or if anything about it is in doubt, the seek does what it does without the option,
+ * and it never fails because of an index. A durable-only reader and a mapped one
+ * (`tickertape_reader_open_mapped_unsafe`) use an index only for a segment before the one the checkpoint marker
+ * names. Do not enable this where someone who may not write the segments can write `seek-index/`: a forged index can
+ * make the reader return bytes from inside a payload that form a valid record. Added in 1.1.
+ *
+ * # Safety
+ *
+ * `options` must be NULL or live reader options, not used by another thread during the call.
+ */
+tickertape_status tickertape_reader_options_set_seek_index(struct tickertape_reader_options *options, int32_t enabled);
 
 /**
  * Sets whether a waiting reader blocks on the writer's wake-up region instead of sleeping, so a new record wakes it
@@ -1871,6 +1921,10 @@ tickertape_status tickertape_reader_open(const char *dir,
  * by replacing files), so the precondition holds in normal operation. If it is broken, returned payloads can change
  * under the caller, and if a mapped file is truncated the process receives `SIGBUS` and dies. Use
  * `tickertape_reader_open` when you cannot rule this out (for example, for journals on shared or untrusted storage).
+ * "Never" is for a journal whose commit words are intact: what storage damage to one can lead to, and for which readers,
+ * is the known limitation in `docs/crash-contract.md` (Readers, the writer and memory safety).
+ * With `tickertape_reader_options_set_seek_index` enabled, the precondition also covers the journal's `seek-index/`
+ * directory and its `checkpoint` file, and an index builder (`tickertape index`) counts as a writer.
  *
  * The pointer rules of `tickertape_reader_open` also apply.
  */
@@ -1895,7 +1949,14 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  *
  * If `seq` has not been written yet, the reader waits for it: reads return `TICKERTAPE_NONE` until the writer gets
  * there, and records before `seq` are skipped. Every record on the way is validated (by the reads that follow), so
- * the reader only lands on positions along the journal's current chain. Any call invalidates the record view
+ * the reader only lands on positions along the journal's current chain, except as below. The way starts at the segment's first record
+ * or, for a forward seek within the reader's segment, at the reader's position if the reader can tell that it is on
+ * the current chain (from 1.1). Records before that position are then not validated again, and if storage damage
+ * destroyed the checkpoint marker, or set it back to an older one, together with covered records, the position can be
+ * off the current chain unnoticed (`docs/crash-contract.md`, "Readers after a repair"); a seek to the last record the
+ * reader passed, or an earlier one, scans the segment, and so does a new reader. With the seek-index option
+ * (`tickertape_reader_options_set_seek_index`, from 1.1), the way may start at an indexed record before `seq`. Records
+ * before it are not read, and crash contract C15 says where the landing place can be off the chain. Any call invalidates the record view
  * returned by `tickertape_reader_next`. A successful seek also discards a record held back by
  * `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
  * `tickertape_reader_read_batch`; a failed seek leaves the reader exactly as it was (same position, held-back
@@ -1909,7 +1970,36 @@ tickertape_status tickertape_reader_close(struct tickertape_reader *reader);
  *
  * `reader` must be NULL or a live reader handle.
  */
-tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint64_t seq);
+tickertape_status tickertape_reader_seek(struct tickertape_reader *reader,
+                                         uint64_t seq);
+
+/**
+ * Positions the reader at the end of the journal, without reading the segments before it: the next record returned
+ * is the first one this call did not find committed (with durable-only, the first one it did not find covered by a
+ * checkpoint). Added in 1.1.
+ *
+ * Under a live writer, "the end" is an observation made during the call: every record committed before the call is
+ * behind the reader, every record committed after it returns is ahead of it, and one committed during the call can
+ * be on either side. No record is skipped or repeated from there on. The call reads at most the newest segment, from
+ * the checkpoint's position if the checkpoint is in it, and any segments the writer rolls to meanwhile, validating
+ * every record it reads; damage in records before that is not noticed. If the writer keeps committing as fast as the
+ * reader validates, the call runs until it catches up; it cannot be interrupted. With durable-only and no valid
+ * checkpoint, the reader is placed at the first record of the oldest segment.
+ *
+ * Any call invalidates the record view returned by `tickertape_reader_next`. On success this also discards a record
+ * held back by `tickertape_reader_next_copy` or `tickertape_reader_read_batch`, and an error deferred by
+ * `tickertape_reader_read_batch`; on failure the reader is left exactly as it was (same position, held-back record
+ * and deferred error).
+ *
+ * Errors: `TICKERTAPE_E_NOT_FOUND`; `TICKERTAPE_E_CORRUPT`, `TICKERTAPE_E_UNSUPPORTED_VERSION` or `TICKERTAPE_E_IO`
+ * while locating it; `TICKERTAPE_E_DISCARDED` if recovery or retention replaced or removed the segment on each of 8
+ * attempts in a row (its message names where the call was reading, not the reader's position).
+ *
+ * # Safety
+ *
+ * `reader` must be NULL or a live reader handle.
+ */
+tickertape_status tickertape_reader_seek_to_end(struct tickertape_reader *reader);
 
 /**
  * Returns the next record as a borrowed view in `*record_out`.
@@ -1932,10 +2022,11 @@ tickertape_status tickertape_reader_seek(struct tickertape_reader *reader, uint6
  * `tickertape_reader_position` and `tickertape_reader_get_metrics`) or until the reader is closed. It is NULL when
  * `payload_len` is 0.
  *
- * Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation (the cursor does not move, so calling
- * again retries the same position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer
- * recovery or retention replaced or removed the segment at the cursor (call `tickertape_reader_seek`);
- * `TICKERTAPE_E_IO`; or an error deferred by `tickertape_reader_read_batch`.
+ * Errors: `TICKERTAPE_E_CORRUPT` if the bytes at the cursor fail validation, or (from 1.1) if the slot there is empty
+ * although the checkpoint marker or a later segment shows that it was filled
+ * (`TICKERTAPE_CORRUPT_EMPTY_COMMIT_WORD`; the cursor does not move in either case, so calling again retries the same
+ * position, which may succeed after a writer recovery); `TICKERTAPE_E_DISCARDED` if writer recovery or retention
+ * replaced or removed the segment at the cursor (call `tickertape_reader_seek`); `TICKERTAPE_E_IO`; or an error deferred by `tickertape_reader_read_batch`.
  *
  * # Safety
  *
@@ -1984,7 +2075,7 @@ tickertape_status tickertape_reader_next_copy(struct tickertape_reader *reader,
  * Partial failure: an error that happens before any record is read is returned directly. An error after one or
  * more records is **not** returned by this call: it returns `TICKERTAPE_OK` with the records read so far, and the
  * next read call on this reader (`next`, `next_copy` or `read_batch`) returns the error. A successful
- * `tickertape_reader_seek` discards it instead. The reader does not advance past the failing position, so a
+ * `tickertape_reader_seek` or `tickertape_reader_seek_to_end` discards it instead. The reader does not advance past the failing position, so a
  * persistent error (such as corruption) is returned again by the calls after that. No record handed out is ever
  * lost to an error.
  *

@@ -45,7 +45,7 @@ wildcard arm. Methods are on docs.rs.
 | `inspect` | `list_segments`, `read_checkpoint`, `verify`, `SegmentInfo` (NE), `SegmentReport` (NE), `SegmentEnd` (NE), `VerifyReport` (NE), `Problem` (NE) |
 | `latency` (from 1.1) | `Recorder`, `View`, `Snapshot`, `Bucket` (NE), `RecordAge`, `RecordAgeView`, `RecordAgeSnapshot` (NE), `WriterLatency` |
 | `retention` | `plan`, `apply`, `Policy` (NE), `Plan`, `PlannedSegment` (NE), `Action` (NE), `Reason` (NE), `Report` (NE) |
-| `seek_index` | `build`, `check`, `remove`, `DIR_NAME`, `BuildReport` (NE), `CheckReport` (NE), `SegmentIndex` (NE), `IndexState` (NE) |
+| `seek_index` (from 1.1) | `build`, `check`, `remove`, `DIR_NAME`, `BuildReport` (NE), `CheckReport` (NE), `SegmentIndex` (NE), `IndexState` (NE) |
 | `status` | `status`, `Sampler`, `ReaderBeacon`, `READERS_DIR`, `DEFAULT_BEACON_INTERVAL`, and the sample's types, all NE: `Status`, `Head`, `HeadEnd`, `Position`, `Cursor`, `Segments`, `CheckpointStatus`, `CheckpointProblem`, `AgeUnknown`, `Exposure`, `Storage`, `Rates`, `WriterProcess`, `BeaconState`, `BeaconDirState`, `BeaconReport`, `ReaderStatus`, `Lag`, `LagUnknown`, `WriterMetrics`, `Thresholds`, `Breach` |
 | `format` | constants (`MAGIC`, `CHECKPOINT_MAGIC`, `FORMAT_VERSION`, the `*_LEN` lengths, `SEAL_MARKER`, `MAX_FRAME_LEN`, `RECORD_ALIGN`, `SEGMENT_SIZE_UNIT`, `MAX_SEGMENT_SIZE`, `SEGMENT_EXTENSION`, `CHECKPOINT_FILE_LEN`, `CHECKPOINT_SLOT_OFFSETS`); header and slot types `SegmentHeader`, `RecordHeader`, `CheckpointSlot`; encoders and decoders (`encode_segment_header`, `decode_segment_header`, `encode_record_body`, `finish_record_body`, `write_record_fields`, `decode_record_body`, `seal_crc`, `encode_checkpoint_slot`, `decode_checkpoint`, `frame_len`, `align8`, `max_payload_len`, `record_fits`, `validate_segment_size`, `segment_file_name`, `parse_segment_file_name`) |
 
@@ -74,8 +74,9 @@ with a changelog entry; a patch release does not.
 library your header came from), ABI version 1 and soname `libtickertape.so.1` from 1.0; additions only within ABI
 version 1.
 
-- **The baseline check.** `crates/tickertape-ffi/abi/tickertape-baseline.h` is the header shipped in 1.0.0 (it
-  declared nothing before 1.0). At every later stable release it becomes that release's header, and
+- **The baseline check.** `crates/tickertape-ffi/abi/tickertape-baseline.h` is the header shipped in the latest
+  stable release, 1.1.0 (181 declarations; 1.0.0 froze 177, and it declared nothing before 1.0). At every stable
+  release it becomes that release's header, and
   `.github/scripts/check_abi_baseline.py` fails CI if a declaration in it is removed or changed (`docs/playbooks/release-checklist.md` → C ABI at 1.0).
 - **Extensible structs** start with `uint64_t struct_size`; the library fills `min(struct_size, its own size)` and
   writes back what it filled, so a newer program can tell which fields an older library wrote. Seven structs are
@@ -172,24 +173,97 @@ it.
 
 **Upgrading and downgrading.**
 
-- *Upgrade:* no migration. (From 1.1 a reader returns an error where an earlier one waited for ever or ended a replay
-  without one: at a zeroed commit word in older history, crash contract C11 and ADR 0050. The contract promised the
-  report, so this is a fix; a program that treats `Error::Corrupt` as fatal can stop at damage it did not see before.
-  Also from 1.1, `Writer::open` refuses, under every recovery policy and without changing anything, a journal whose
-  checkpoint marker its segment's records do not reach, with `Error::Corrupt` and `DanglingCheckpoint` (ADR 0056):
-  segments restored from a backup while a newer `checkpoint` file was kept, or the last record the marker covers
-  damaged. 1.0.0 opened such a journal and appended after a gap that no reader can pass. Before upgrading, run
-  `tickertape verify` on journals that were restored or had storage errors; after a refusal, see `operations.md` →
-  After a crash.) Close the writer (a journal whose writer did not close is recovered at the next open as
+- *Upgrade:* no migration. What a release changes that a caller or an operator sees, and what to do before
+  upgrading, is in [Upgrading](#upgrading) below, release by release. Close the writer (a journal whose writer did not close is recovered at the next open as
   after a crash, crash contract C1/C2), install the new version and open the journal with it. Readers
-  and CLI commands of either version can read the result. Tested: old readers on journals the new writer left.
-  Not tested: an old reader process following a new writer live.
+  and CLI commands of either version can read the result. Tested: old readers on journals the new writer left, and,
+  from 1.1, 1.0.0 readers following a 1.1 writer live and the other way round (`tests/compat/v1.0.0-wake-ups.sh`,
+  every pairing of writer and reader versions, no record missed or repeated).
 - *Downgrade of readers or the CLI:* covered by "old code reads new journals" above, back to v0.1.0.
 - *Downgrade of the writer:* not promised and not tested. In particular, after an OS crash or power loss, a journal
   written by the current writer can contain a segment whose header never reached the disk; the current writer
   restores it at open (ADR 0038 → Rolls without a sync, `RecoveryAction::RestoredHeader`), but older writers do not
   know that state. Until a writer of the current version has opened such a journal, readers and `verify` of any
   version see that segment's header as invalid.
+
+## Upgrading
+
+What a 1.x release changes that a caller or an operator sees, and what to do about it. Each point names the
+changelog entry and the decision record it comes from; the changelog has the details.
+
+### 1.0 to 1.1
+
+No migration: the on-disk format is still version 1, the C ABI still ABI version 1 (additions only), and a 1.1 writer
+opens and continues a journal that 1.0.0 wrote. Before upgrading, check journals that were restored from a backup or
+had storage errors with the 1.1 CLI: `tickertape status` predicts the refusal described first below
+(`checkpoint.problem` `dangling`, exit 2), and `tickertape verify` finds damaged records.
+
+- **The writer refuses a marker its records do not reach** (ADR 0056). `Writer::open` fails, under every recovery
+  policy and without changing anything, with `Error::Corrupt` and `DanglingCheckpoint` (C code 13, Python
+  `dangling_checkpoint`) where 1.0.0 opened the journal and appended after a gap that no reader can pass: segments
+  restored from a backup while a newer `checkpoint` file was kept, or a journal whose last record before the marker's
+  offset is zeroed or damaged. Restore the backup's marker with its segments (`operations.md` → Restoring from a
+  backup); after a refusal, see `operations.md` → After a crash.
+- **`status`, retention and `archive` on such a journal** (ADR 0056, amendment). `status` reports the new
+  `checkpoint.problem` value `dangling` (exit 2, `tickertape_checkpoint_invalid` 1, `tickertape_healthy` 0) where 1.0
+  reported most of these journals as healthy. A retention run (the writer's own, `retention::plan` and `apply`,
+  `tickertape archive`, `--dry-run` included) fails with the writer's error and removes nothing, where 1.0 removed
+  the segments before the marker's. From 1.1 the `checkpoint.problem` values and the breach codes may grow in a minor
+  release: treat a value you do not know as a problem.
+- **A reader reports an empty slot that cannot be the head** (ADR 0050, crash contract C11). A reader returns
+  `Error::Corrupt` with `EmptyCommitWord` at a zeroed commit word that the marker covers or a later segment shows to
+  have been filled, where 1.0.0 waited for ever or ended a replay without an error; `export`, `stats` and `tail` exit 2
+  where they exited 0. The error comes in the call that meets the first empty slot after an open or a seek, otherwise
+  after at most 100 ms at the slot (1.1 s if only a later segment shows it) plus 50 ms. A program that treats
+  `Error::Corrupt` as fatal can stop at damage it did not see before: find it with `tickertape verify`.
+- **A blocking durable-only reader is woken by checkpoints** (ADR 0053). Appends no longer make a wake-up system call
+  for it. When the writer's helper threads share its CPU, the last records of a large backlog can reach it up to about
+  2 ms later than a reader that polls the marker: keep them on other CPUs (`WriterConfig::helper_cpus`).
+- **Early write-back stops below the block the writer is filling** (Linux, the default; ADR 0058, change 1). A
+  checkpoint, and a roll's write-back of the old segment's tail, may find up to 128 KiB more to write. No setting
+  changes and nothing is to be done.
+- **Two more open files on Linux** (ADR 0059, ADR 0054). The prefault helper, not the writer's thread, unmaps and
+  closes the segments a writer lets go of, and up to two wait for it: two more files and two more segment mappings.
+  1.0.0 stated no count; 1.1 does (`operations.md` → Open files): at most 21 files on Linux by default, 22 with the
+  spare segment, 20 with early write-back off, 18 on macOS and with `prefault(false)`. If you set the limit on open
+  files (`ulimit -n`, `LimitNOFILE=`) close to what a 1.0.0 writer used, raise it by two on Linux. Keep the helper
+  threads off the writer's CPU, or the helper's `munmap` can delay an append as long as a roll used to.
+- **`Reader::open` keeps up with a fast retention run** (ADR 0016, note of 2026-11-27). When the oldest segment it
+  listed is gone, a reader opens the next one of the same listing; it returns the I/O "not found" error only after 64
+  failed opens (8 listings of up to 8 segments), where 1.0.0 gave up after 8. Nothing to do.
+- **An archiver takes a segment out before it lets it go** (ADR 0055). `retention::apply` and `tickertape archive`
+  (not a writer's own retention) rename a segment to `{base:020}.tape.{pid}.{unix_ns}.removing` in the journal
+  directory before deleting it or finishing a move by copy. A crash can leave that file, and it may hold records the
+  journal no longer has: `status` (`removal_leftovers`) and `archive` (`report.leftovers`,
+  `retention::Report::leftovers`) list it, a later retention run unlinks it only under the conditions of
+  `format.md`, and `operations.md` → Archiving and deleting old segments says how to keep it or put it back.
+- **Retention reads only what its policy needs** (ADR 0051). Damage in a segment the policy does not need (an invalid
+  header, a file that cannot be opened) no longer makes retention, `retention::plan` or `tickertape archive` fail: run
+  `tickertape verify` to find it. A segment missing in the middle of the chain during a removal is
+  `Error::Corrupt` (`BrokenChain`) where it could be an `Error::Io`. Do not put segment files back into a journal
+  while retention runs on it.
+- **`Reader` is 16-byte aligned** (ADR 0057). Its layout is `#[repr(C, align(16))]` and it is 464 bytes instead of
+  456, so a `#[repr(packed)]` struct can no longer contain a `Reader` (a compile error; `cargo semver-checks` reports
+  `repr_align_added`). Nothing else changes for callers.
+- **Seek indexes** (ADR 0045). Only if you build them (`tickertape index`): 1.0.0's `export --output` fails with exit 1,
+  and must be run again, if it cannot list `seek-index/` or the directory vanishes while it runs.
+
+**1.0.0 and 1.1 processes on one journal.** Readers of either version follow and replay what a writer of either
+version writes, live included (`tests/compat/v1.0.0-wake-ups.sh`). What differs:
+
+- Wake-ups (ADR 0053): every pairing works. A 1.1 durable-only reader beside a 1.0.0 writer polls the marker every
+  `Backoff::max_sleep` (1 ms by default) instead of registering; a 1.0.0 durable-only reader beside a 1.1 writer waits
+  as before, and the writer pays a wake-up call per append for it, as a 1.0.0 writer does.
+- A 1.0.0 writer still opens a journal whose marker its records do not reach, and 1.0.0's `status` reports most of
+  them as healthy: upgrade writers and monitoring together. 1.0.0's readers still wait at an empty slot in history
+  (ADR 0050).
+- Only a 1.1 archiver takes a segment out first; a 1.0.0 archiver keeps the race of issue #83. 1.0.0's readers,
+  writer, recovery, `verify`, `status` and `archive` ignore the `*.removing` names a 1.1 archiver can leave and never
+  unlink them (`tests/compat/v1.0.0-ignores-removing.sh`); only a 1.1 retention run does.
+- 1.0.0 ignores `seek-index/` (`tests/compat/v1.0.0-ignores-seek-index.sh`), except for `export --output` above. A
+  1.0.0 writer does not remove indexes before it repairs a journal, so 1.1 readers that use them then rely on the
+  checks by value alone (crash contract C15).
+- A 1.0.0 writer continuing a journal that a 1.1 writer wrote is a writer downgrade: not promised (above).
 
 ## Crash contract
 

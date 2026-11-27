@@ -2,7 +2,7 @@
 name = "tickertape-python"
 # Keep in step with `[workspace.package].version` in the root Cargo.toml; `release.py prepare` checks it.
 # maturin takes the wheel's version from here (pyproject.toml declares `version` as dynamic).
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 # PyO3 0.30 needs Rust 1.85, the same as the workspace MSRV; this crate is checked with stable Rust only.
 rust-version = "1.85"

@@ -220,11 +220,13 @@ output with the other release notes; record numbers in `docs/benchmarks.md` only
 
 Issue #86 (ADR 0057): replay speed changed with the layout of `Reader`, and CI measures no timings. Before every
 release, on one quiet cloud VM of each architecture (x86-64 and aarch64, local SSD; `docs/playbooks/run-benchmark.md`,
-machine rules), build three `replay` benchmark binaries (`cargo bench -p tickertape-bench --bench replay --no-run`;
-the binary is `target/release/deps/replay-*`), from the same workspaces as for the append path above: the previous
-tag's workspace (the baseline), a second copy of that binary (the noise floor), and the previous tag's workspace with
-the candidate's `crates/tickertape` copied over it (or the fallback described there). Run them interleaved, at least 10
-rounds in rotating order, each in a new process, with `TMPDIR` on the SSD:
+machine rules), build three `replay` benchmark binaries (`cargo bench -p tickertape-bench --bench replay --no-run
+--message-format=json`; the binary is the `executable` of the `replay` artefact: Cargo 1.99 writes it to
+`target/release/deps/replay-*`, Cargo 1.100 to `target/release/build/tickertape-bench/<hash>/out/replay-*`), from the
+same workspaces as for the append path above: the previous tag's workspace (the baseline), a second copy of that binary
+(the noise floor), and the previous tag's workspace with the candidate's `crates/tickertape` copied over it (or the
+fallback described there). Run them interleaved, at least 10 rounds in rotating order, each in a new process, with
+`TMPDIR` on the SSD:
 
 ```sh
 TMPDIR=<ssd>/tmp <replay binary> --bench 'replay/records/' --warm-up-time 1 --measurement-time 2 --noplot
