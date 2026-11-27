@@ -94,13 +94,15 @@ where it runs.
 For example, on Linux x86-64, after downloading both files:
 
 ```sh
-grep 'x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum --check --strict
-tar -xzf tickertape-v0.5.1-x86_64-unknown-linux-gnu.tar.gz
+grep ' tickertape-v1.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum --check --strict
+tar -xzf tickertape-v1.1.0-x86_64-unknown-linux-gnu.tar.gz
 mkdir -p "$HOME/.local/bin"
-cp tickertape-v0.5.1-x86_64-unknown-linux-gnu/tickertape "$HOME/.local/bin/"
+cp tickertape-v1.1.0-x86_64-unknown-linux-gnu/tickertape "$HOME/.local/bin/"
 "$HOME/.local/bin/tickertape" --version
 ```
 
+Match the whole file name: `SHA256SUMS` also lists the C library archive with the same suffix
+(`tickertape-c-v1.1.0-x86_64-unknown-linux-gnu.tar.gz`), and the check fails for a listed file that was not downloaded.
 On macOS, use `shasum -a 256 -c` instead of `sha256sum --check --strict`, and select the archive suffix for your CPU.
 The macOS binaries are unsigned and are not notarized. If macOS blocks a downloaded binary, review the source and
 release checksum, then allow it through System Settings → Privacy & Security, or install with Cargo.

@@ -17,6 +17,13 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   Ryzen 9 7950X, their commercial Rust queue) beside the same scenario on two Google Cloud VMs for tickertape and
   open-source Chronicle Queue 2026.8, on tmpfs and ext4, from the scheduled send and from the send start; the
   published row is labelled as theirs, not measured by us.
+- Added: the v1.1.0 compatibility fixtures (macOS and Linux aarch64), written by the released version from the tag's
+  own tree (ADR 0033).
+- Docs: the roadmap's status lines say what 1.1.0 changed (seek indexes, latency histograms, the roll and stall work of
+  ADRs 0058 and 0059, the 1.0.0 gaps), and a new section "After 1.1" lists the proposed next steps.
+  `docs/compatibility.md` lists v1.1.0 among the versions whose journals are tested. Fixed: `docs/install.md`'s example
+  checked the CLI archive with a pattern that also matches the C library archive, so `sha256sum --check --strict` failed
+  when only the CLI archive was downloaded; it now matches the whole file name of the current release.
 
 ## [1.1.0] - 2026-11-27
 
