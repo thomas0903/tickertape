@@ -12,7 +12,7 @@ the owner enables Maven Central ([`docs/install.md`](../../docs/install.md#java-
 
 ```bash
 cargo build --release -p tickertape-ffi                  # from the repository root: target/release/libtickertape.*
-mvn -f bindings/java/pom.xml package -DskipTests         # bindings/java/target/tickertape-1.0.0.jar
+mvn -f bindings/java/pom.xml package -DskipTests         # bindings/java/target/tickertape-1.1.0.jar
 ```
 
 To run the tests, build the CLI and the C test programs too, then `mvn verify` (with `JAVA_HOME` pointing at a JDK 25):
@@ -30,7 +30,7 @@ source with the `java` launcher (on Linux the library is `libtickertape.so`):
 ```bash
 cd bindings/java
 example() {
-    java --enable-native-access=ALL-UNNAMED -cp target/tickertape-1.0.0.jar \
+    java --enable-native-access=ALL-UNNAMED -cp target/tickertape-1.1.0.jar \
         -Dtickertape.library.path=../../target/release/libtickertape.dylib examples/Example.java "$@"
 }
 example follow /tmp/tt-java 20 &        # waits for the writer to create the journal

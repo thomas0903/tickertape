@@ -5,62 +5,59 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
-- Docs: charts of the performance results beside their tables, in light and dark variants: in the README the comparison
-  at v1.0.0 (W1 and W3 throughput, W2 reader p99.9, the ten-minute probe; ext4, pinned), and in `docs/benchmarks.md`
-  the same plus the ten-minute paced runs (SV on ext4 and xfs, SD on ext4) and before and after charts with their costs
-  for ADR 0058, ADR 0059 and the seek index. Each run is a point where the tables give a range. The values are in
-  `docs/charts/data/`, checked against the tables by `docs/charts/check_tables.py`; `docs/charts/make.py` draws the
-  SVGs. The README's Performance section has a new "Since 1.0.0" list; no published number or sentence changed.
-- Fixed: a spare segment that came to nothing (its preparation failed after its blocks were allocated) gives its
-  blocks back even while another descriptor of its file is open, such as the copy a child process forked at that moment
-  holds until it executes its new program. It is truncated before its name is removed, if it has no other name; so are
-  a spare the roll discards, the file a panicked spare thread left, and the temporary file of a segment a roll failed
-  to create. Before, a roll that had run out of space while the spare held it could fail with "no space" when it tried
-  again (Linux with `WriterConfig::spare_segment`), and on macOS the roll's own create that follows a failed spare
-  could. ADR 0049 amendment of 2026-11-27; issue #73.
-- Docs: the rustdoc of `Reader::seek_to_end` (new in 1.1) states that a file named like a segment without a valid
-  header where the call starts (for a visible reader the newest name, even an empty or foreign file) is
-  `Error::Corrupt` naming that file, as at `Reader::open`, and that a durable-only reader opens no name later than the
-  one that holds the marker's position (issue #112, ADR 0046, note of 2026-11-27). Behaviour unchanged; new tests for
-  both readers and a durable-only reader.
-- Fixed: `Reader::open` and `Reader::open_mapped` could fail with an I/O "not found" error for a segment they had just
-  listed while a retention run removed segments one after another, oldest first, about as fast as a reader lists the
-  directory (seen on tmpfs, where syncing the directory after each removal does nothing: Linux, 64 KiB segments, a run
-  catching up dozens of segments; present since 1.0.0). Each try chose the oldest segment of a new listing, which the
-  run then removed, so all 8 tries were lost to one run. A reader whose oldest listed segment is gone now opens the
-  next segment of the same listing (it keeps the 8 oldest bases), and lists again only after those. A durable-only
-  reader's `seek_to_end` that starts at the oldest segment (no valid checkpoint marker, or one naming the oldest
-  segment) does the same; `seek` is unchanged. At most 64 opens fail (8 listings of up to 8 segments each) before the
-  I/O "not found" error. ADR 0016 (note of 2026-11-27).
-- Changed (Linux): a writer that rolls without checkpoints, or faster than its checkpoints take segments off its
-  hands, no longer unmaps and closes the oldest segment it keeps open inside the roll's `append`: the prefault helper
-  (`tickertape-prefault`) does it, once it has caught up with prefaulting (ADR 0059, proposed; part of issue #60). At
-  most two such segments wait for the helper, the one it is closing included; when two wait, or the helper has ended
-  (it panicked), the writer closes the next one itself, as before, and it never waits for the helper. The same goes for
-  a `request_checkpoint` that lets go of segments. Unmapping and closing writes nothing, so durability and readers are
-  unchanged: the next checkpoint syncs the data, as before. With `WriterConfig::prefault(false)`, and on macOS, nothing
-  changes (the one macOS measurement looked worse with the hand-off and was not repeated). The helper's `munmap` runs
-  where the helpers run: keep them off the writer's CPU (`WriterConfig::helper_cpus`), or it can delay an ordinary
-  append by as long as the roll used to. **On Linux the number of files a writer can hold open goes up by two** (the two
-  waiting segments, which are also two more segment mappings): at most 21 by default, 22 with the spare segment and 20
-  with early write-back off, against 19, 20 and 18 (ADR 0054, amended; `docs/operations.md` → Open files); macOS stays
-  at 18, and every platform with `prefault(false)`. On Linux kernels before 5.14, which reject the prefault advice, the
-  helper now keeps running after its first advice, only to release segments. New: `tests/segment_release.rs` (with an
-  `strace` test that CI requires on Linux), the hold point `fault::Point::SegmentRelease` and the failure point
-  `fault::Point::SegmentReleasePanic`, and the hidden test accessor `Writer::segments_awaiting_release` (feature
-  `fault-injection`). The `strace` tests (also `tests/writer_latency.rs`) now skip only when `strace` cannot run; a
-  traced child that fails fails them.
-  Measured on one x86-64 and one aarch64 Google Cloud VM (ext4, 128 MiB segments, steady-50, one 60-second run per
-  build and configuration): without checkpoints the `munmap` of the released segment was 78–94 % of a roll, and the
-  roll's append fell from 0.83–1.06 ms to 169–179 µs at the median (0.71–0.94 ms to 49–60 µs with the spare segment),
-  its maximum from 0.73–1.14 ms to 60–211 µs; with checkpoints every second nothing changed; instructions per append are
-  unchanged. A second x86-64 session (6 strictly alternating pairs per cell, against `main` with ADR 0058's change 1)
-  settled round 1's open results: the writer thread takes fewer page faults with the change (lower in 20 of 24 pairs
-  without checkpoints), and p99.99 is within the base-to-base spread in three of four cells without checkpoints (lower
-  in 4 of 6 pairs at 1,024 B with the spare segment, the cell that looked worse in round 1); at 64 B without the spare
-  segment it is about 0.5 µs higher in all 6 pairs (6.0–6.6 → 6.6–7.0 µs), a small cost that is not explained. One
-  aarch64 round-1 run had a 1.03 ms append that was not a roll (`docs/benchmarks.md` → "2026-11-26, finished segments
-  released off the writer's thread").
+## [1.1.0] - 2026-11-27
+
+A minor release: seek indexes and `tickertape index`, `Reader::seek_to_end` in every binding, opt-in latency histograms
+and `tickertape age`, and on Linux an optional spare segment; and fixes of defects present since 1.0.0, several of which
+change what a caller or an operator sees. Read **Behaviour changes** first; `docs/compatibility.md` → Upgrading → "1.0
+to 1.1" says for each what you see and what to do, including what a deployment that runs 1.0.0 and 1.1 processes on one
+journal does. The on-disk format is still version 1; the C ABI is still ABI version 1, with additions only
+(`crates/tickertape-ffi/abi/tickertape-baseline.h` is now the 1.1.0 header, 181 declarations, 4 more than 1.0.0's).
+Nothing public in 1.0.0 is removed or renamed; `cargo semver-checks` against `v1.0.0` reports one change, the alignment
+of `Reader` (the last behaviour change below). The minimum Rust (1.85), CPython (3.11) and JDK (25) versions are
+unchanged. Every entry made since 1.0.0 is below, grouped; where a feature changed again before this release, its entry
+describes what is released.
+
+### Behaviour changes to know before upgrading
+
+- Fixed: `Writer::open` refuses a checkpoint marker whose position the records of its segment do not reach (ADR 0056,
+  issue #87). The record right before the marker's offset must be there, valid, end exactly at that offset and carry the
+  sequence number below the marker's `next_seq` (at offset 64, `next_seq` must be the segment's base). Otherwise the
+  open fails under every recovery policy with `Error::Corrupt`, reason `DanglingCheckpoint` (C ABI code 13, Python
+  `dangling_checkpoint`), reported at the segment and the marker's offset, before anything is changed. **Behaviour
+  change:** 1.0.0 opened such a journal, continued at the marker's position and made the gap below it permanent. Two
+  kinds of journal are refused now: segments restored from a backup while a newer `checkpoint` file was kept (restore
+  the backup's marker with them: `docs/operations.md` → Restoring from a backup), and a journal whose last record before
+  the marker's offset, in the marker's segment, is zeroed or damaged (`verify` already reported it). Damage to any
+  earlier covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that
+  honours its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only
+  the record before the marker: on a healthy journal it adds work proportional to that record's length.
+- Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
+  that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is
+  `Error::Corrupt` with `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for
+  ever, and a replay ended without an error. **What callers see changes:** an error where a wait was. It comes in the
+  call that meets the first empty slot after opening or seeking, otherwise after at most 100 ms at the slot (1.1 s if
+  only a later segment shows it), plus 50 ms in which the slot is read again; it is returned on every call, since no
+  reader gets past it. `export`, `stats` and `tail` exit 2 where they ended with 0 (as does `age`, new in 1.1), and
+  `export --durable-only` names the damage instead of "journal changed". After a repair in place, a visible reader whose
+  position is inside a record of the new history gets `Error::Discarded` where it waited until it was seeked. `verify`
+  also reports a newest segment that ends before what the marker covers, and the pure-Python decoder, with
+  `durable_only`, an empty slot below the marker. Not detected: a zeroed word that nothing covers, such as in the newest
+  segment at or after the marker (`docs/crash-contract.md`, C11). A waiting reader now reads the marker ten times a
+  second and lists the segments when the directory has changed, at most once a second; the record path, the C ABI's
+  declarations and the on-disk format are unchanged, and any writer works, 1.0.0 included.
+- Changed: a durable-only reader that blocks at the checkpoint boundary is woken by checkpoints only, not by every
+  append (ADR 0053, issue #82). Checkpoints bump an event count of their own in the wake-up region, and a capability
+  word says which writers do. A change made after 1.0.0 and never released (#66, which made the reader's marker check
+  fast) had such a reader sleep between appends, so that the writer made a wake-up system call for almost every record
+  (append p50 0.54 → 0.75 µs on aarch64, 0.56 → 1.20 µs on x86-64, against 1.0.0); now appends make none for it, and are
+  faster than 1.0.0's with such a reader (p50 0.30 against 0.51 µs on aarch64, 0.44 against 0.56 µs on x86-64;
+  `docs/benchmarks.md`, 2026-11-26). Beside a 1.0.0 writer, which does not bump those words, a durable-only reader polls
+  the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that writer pays nothing for it
+  either; a 1.0.0 durable-only reader beside a new writer waits as before. The last records of a large backlog can reach
+  a durable-only reader up to about 2 ms later than a reader that polls the marker when the writer's helper threads
+  share its CPU (`WriterConfig::helper_cpus` avoids it). The `notify` record, the on-disk format, the API and the ABI do
+  not change; every pairing of 1.0.0 and new processes works (`tests/compat/v1.0.0-wake-ups.sh`).
 - Changed (Linux): early write-back stops at the 128 KiB boundary below the writer instead of at the page that holds its
   position (ADR 0058, change 1; issue #60), so that it no longer writes back, and write-protects, the page-cache folio
   the writer is still filling (128 KiB on recent ext4 and xfs with the default `read_ahead_kb`), which the device then
@@ -81,25 +78,281 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   ext4 (its maxima down from 61–111 ms to 0.6–1.0 ms), 148–180 → 158–366 µs on kernel 6.8. On kernel 6.8, whose ext4 has
   no large folios, no gate figure differed. The first gate set for this default ("no cell worse") was narrowly missed
   and the orchestrator accepted it (ADR 0058 → "Decision for change 1"); a private constant,
-  `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour.
-- Changed: a reader waiting at an empty slot no longer reads every later file name without a valid segment header
-  again at each listing (issue #89, ADR 0050 amendment of 2026-11-27). Such names (stray files named like segments) are
-  no evidence, but with 10,000 of them an idle visible reader's `try_next` spent 105–168 ms (macOS) or up to 32 ms
-  (Linux VM) once a second reading them (the issue reported 0.47–0.50 s, which was not reproduced). A listing now reads
-  every new name (or another file at a known name, by its inode number) and at most 256 of the others, the ones read
-  longest ago; the first check after an open or a seek still reads them all. A header written into such a file in place
-  is seen within `ceil(M / 256)` listings (`M` such names; at the next one up to 256, as before; crash contract C11), a
-  segment linked or renamed into place at the next one if its file has another inode number than the stray it replaced,
+  `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour. The release check of 1.1.0 against 1.0.0 (x86-64,
+  kernel 7.0, 1,024 B at 100,000 records/s with background checkpoints every second, 10 rounds; `docs/benchmarks.md` →
+  "2026-11-27, release 1.1.0 against 1.0.0") is consistent with that cost at a roll: the roll's append p50 151 → 162 µs
+  and the writer's maximum, a roll in every run, 172 → 183 µs (medians of the rounds; the second copy of 1.0.0 166 µs),
+  while p50, p99 and p99.9 fell. It is attributed by its mechanism, not by a separate run.
+- Changed (Linux): a writer that rolls without checkpoints, or faster than its checkpoints take segments off its hands,
+  no longer unmaps and closes the oldest segment it keeps open inside the roll's `append`: the prefault helper
+  (`tickertape-prefault`) does it, once it has caught up with prefaulting (ADR 0059, accepted; part of issue #60). At
+  most two such segments wait for the helper, the one it is closing included; when two wait, or the helper has ended (it
+  panicked), the writer closes the next one itself, as before, and it never waits for the helper. The same goes for a
+  `request_checkpoint` that lets go of segments. Unmapping and closing writes nothing, so durability and readers are
+  unchanged: the next checkpoint syncs the data, as before. With `WriterConfig::prefault(false)`, and on macOS, nothing
+  changes (the one macOS measurement looked worse with the hand-off and was not repeated). The helper's `munmap` runs
+  where the helpers run: keep them off the writer's CPU (`WriterConfig::helper_cpus`), or it can delay an ordinary
+  append by as long as the roll used to. **On Linux the number of files a writer can hold open goes up by two** (the two
+  waiting segments, which are also two more segment mappings): at most 21 by default, 22 with the spare segment and 20
+  with early write-back off, two more than without this change (ADR 0054, amended; `docs/operations.md` → Open files);
+  macOS stays at 18, and every platform with `prefault(false)`. On Linux kernels before 5.14, which reject the prefault
+  advice, the helper now keeps running after its first advice, only to release segments. New: `tests/segment_release.rs`
+  (with an `strace` test that CI requires on Linux), the hold point `fault::Point::SegmentRelease` and the failure point
+  `fault::Point::SegmentReleasePanic`, and the hidden test accessor `Writer::segments_awaiting_release` (feature
+  `fault-injection`). The `strace` tests (also `tests/writer_latency.rs`) now skip only when `strace` cannot run; a
+  traced child that fails fails them. Measured on one x86-64 and one aarch64 Google Cloud VM (ext4, 128 MiB segments,
+  steady-50, one 60-second run per build and configuration): without checkpoints the `munmap` of the released segment
+  was 78–94 % of a roll, and the roll's append fell from 0.83–1.06 ms to 169–179 µs at the median (0.71–0.94 ms to 49–60
+  µs with the spare segment), its maximum from 0.73–1.14 ms to 60–211 µs; with checkpoints every second nothing changed;
+  instructions per append are unchanged. A second x86-64 session (6 strictly alternating pairs per cell, against `main`
+  with ADR 0058's change 1) settled round 1's open results: the writer thread takes fewer page faults with the change
+  (lower in 20 of 24 pairs without checkpoints), and p99.99 is within the base-to-base spread in three of four cells
+  without checkpoints (lower in 4 of 6 pairs at 1,024 B with the spare segment, the cell that looked worse in round 1);
+  at 64 B without the spare segment it is about 0.5 µs higher in all 6 pairs (6.0–6.6 → 6.6–7.0 µs), a small cost that
+  is not explained. One aarch64 round-1 run had a 1.03 ms append that was not a roll (`docs/benchmarks.md` →
+  "2026-11-26, finished segments released off the writer's thread").
+- Docs: `docs/operations.md` → Open files states how many files a writer can hold open (ADR 0054, issue
+  #73); 1.0.0 stated no number. The guarantee in 1.x is that the count is bounded, whatever the number of segments and
+  however far its background checkpoints fall behind; in this release it is at most 18 on macOS, 21 on Linux by default,
+  22 on Linux with the spare segment, 20 on Linux with early write-back off, and 18 on every platform with
+  `WriterConfig::prefault(false)` (the Linux counts include the two segments of ADR 0059, above), and a later 1.x
+  release that raises it says so here. A checkpoint now closes each segment it reopens before it opens the next, which
+  lowered that number by one. The descriptor tests of `tests/open_segments.rs` reach the worst case with hold points
+  (new: `fault::Point::CheckpointReopen`, and `fault::Point::EarlyWriteback` as a hold point) instead of depending on
+  machine load, and the spare-segment one is no longer ignored.
+- Fixed: `Reader::open` and `Reader::open_mapped` could fail with an I/O "not found" error for a segment they had just
+  listed while a retention run removed segments one after another, oldest first, about as fast as a reader lists the
+  directory (seen on tmpfs, where syncing the directory after each removal does nothing: Linux, 64 KiB segments, a run
+  catching up dozens of segments; present since 1.0.0). Each try chose the oldest segment of a new listing, which the
+  run then removed, so all 8 tries were lost to one run. A reader whose oldest listed segment is gone now opens the next
+  segment of the same listing (it keeps the 8 oldest bases), and lists again only after those. A durable-only reader's
+  `seek_to_end` that starts at the oldest segment (no valid checkpoint marker, or one naming the oldest segment) does
+  the same; `seek` is unchanged. At most 64 opens fail (8 listings of up to 8 segments each) before the I/O "not found"
+  error. ADR 0016 (note of 2026-11-27).
+- Fixed: `tickertape status` (`status::status`, `Sampler`) predicts that refusal, and retention removes nothing from
+  such a journal (ADR 0056, amendment; issue #93). The sample runs the writer's own check on the record before the
+  marker's offset and reports the new `checkpoint.problem` value `dangling` (`CheckpointProblem::Dangling`, C ABI
+  `TICKERTAPE_CHECKPOINT_DANGLING` = 4, C++ `dangling`, Java `DANGLING`, Python `"dangling"`): exit 2,
+  `checkpoint_invalid`, `tickertape_healthy` 0, as for the other values. 1.0 reported most of these journals as healthy.
+  Those that 1.0 already reported as corrupt, through `head_invalid` with `problem` null (a marker in the newest segment
+  whose `next_seq` or offset disagrees with the records there), keep exit code 2 and now also report
+  `checkpoint_invalid` and `problem` `dangling` (`tickertape_checkpoint_invalid` 0 → 1). A retention run (the writer's
+  own, `retention::plan` and `apply`, `tickertape archive`, `--dry-run` included) fails with the writer's error,
+  `DanglingCheckpoint` at the segment and the marker's offset, and removes nothing, so the segments that restoring the
+  matching marker needs stay; 1.0 removed the segments before the marker's. Each costs one more read, of that record
+  (normally one 4 KiB `pread`; for retention once per run). **Behaviour change:** from 1.1 the sets of `status`
+  `checkpoint.problem` values and of breach codes may grow in a minor release (`docs/cli.md`): treat a code you do not
+  know as a problem. Not detected, by decision: a marker at offset 64 whose previous segment lacks records (the ADR's
+  amendment says why; `verify` and readers report it).
+- Fixed: an archiver (`retention::apply`, `tickertape archive`) could remove the checkpoint marker's segment, leaving a
+  dangling marker that a writer refuses, when the marker was lost, the oldest segment damaged and a writer recovered
+  between the archiver's checks of that segment and its removal (issue #83, ADR 0055; present since 1.0.0). An archiver
+  now takes the segment out of the journal with a no-replace rename, checks that it took the file it checked and that
+  the marker, read again, names a later segment (for a move by copy, also that the file still holds what was copied),
+  and only then lets it go; otherwise it renames it back and stops with the error. A writer's own retention run, which
+  holds the writer lock, is unchanged. **Behaviour changes:** a deletion, and a move by copy, now go through a temporary
+  name in the journal directory, `{base:020}.tape.{pid}.{unix_ns}.removing` (`docs/format.md`), which a crash can leave
+  behind. Readers, writers and `verify` ignore it (1.0.0 included); `status` (`removal_leftovers`) and `archive`
+  (`report.leftovers`; `retention::Report::leftovers`) report it. It may hold records the journal no longer has, so a
+  later retention run unlinks it only once retention has removed the segment its seal names (and its name is an hour old
+  and its process gone); `docs/operations.md` says how to keep it or put it back. An archiver's removal costs a rename,
+  a `stat` and a read of the marker more than before.
+- Changed: retention reads only what its policy needs and lists the journal directory once per run (ADR 0051, issue
+  #80). A checkpoint with a policy used to open every segment; now `max_segments` needs the file names, `max_age` the
+  headers of the oldest segments, and `max_bytes` the file sizes (which a writer keeps between its runs) and the headers
+  of the files whose size nothing else confirms (in a journal of one segment size, the newest). Removing a segment no
+  longer lists the directory. The segments removed are the same. **Behaviour changes:**
+  - An invalid header, or a file that cannot be opened, in a segment the policy does not need no longer makes retention,
+    `retention::plan` and `tickertape archive` fail (1.0.0 documented that `plan` read every header). It still does in
+    the segments to remove, the one after them and the marker's, with `max_age` the first that stays and its successor,
+    and with `max_bytes` the files whose headers it reads. Run `tickertape verify` to find damage.
+  - With `max_bytes`, a file as long as the one before it counts with its length, also if its header names another size
+    (1.0.0 failed there).
+  - A segment found missing in the middle of the chain during a removal, in a race with its removal by hand, is reported
+    as `Error::Corrupt` (`BrokenChain`), where it could be an `Error::Io` ("not found").
+  - An I/O error on the marker during `retention::apply` is returned even when another archiver has just removed that
+    segment.
+  - Do not put segment files back into a journal while retention runs on it.
+- Fixed: a reader replayed 15 to 30 % slower, on Linux x86-64 and aarch64, when it happened to sit in memory so that a
+  page boundary fell inside the record it decodes into: the record path stores and loads that record 16 bytes at a time,
+  and such an access split across two pages is slow (ADR 0057, issue #86; present since 1.0.0). About one process in 200
+  of the benchmarks hit it by chance. `Reader` now has a fixed layout, `#[repr(C, align(16))]` in the order rustc had
+  chosen, so that no such access can straddle a page and the record path compiles as before; a test pins the layout, and
+  the release checklist runs the replay benchmark against the previous release on both architectures. No function,
+  signature or C ABI declaration changes, but `size_of::<Reader>()` is 464 bytes instead of 456 and its alignment 16
+  bytes instead of 8, so a `#[repr(packed)]` struct can no longer contain a `Reader` (`cargo semver-checks` reports this
+  as `repr_align_added`, which Cargo's SemVer rules count as a breaking change). The slowdown seen on an Apple M4 Pro in
+  #85 was not measured again.
+
+### Added
+
+- Added: seek indexes (ADR 0045, issue #59; crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`,
+  `check`, `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
+  `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java
+  `seekIndex`, CLI `--seek-index` of `tail`, `export` and `stats`) starts a seek in such a segment less than 64 KiB of
+  records before the target. Off by default: records before the place a seek lands on are then not read, so damage there
+  no longer stops the reader, and a forged index can mislead it. Segments of the recovery domain and the newest segment
+  have no index. `seek_index::build` removes an index it has just published if it cannot check, for another reason than
+  "not found", that the segment is still in place. The on-disk format stays version 1, released versions ignore the
+  files (except that 1.0.0's `export --output` fails if it cannot list the directory), and the C ABI stays at ABI
+  version 1 (an added function). The alias check of `export --output` no longer descends into `seek-index/`.
+- Added: `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek
+  indexes of segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and
+  `archive` remove a segment's index after the segment. Without a `seek-index/` directory this is one failed `open`
+  each.
+- Added: `Reader::seek_to_end` (C `tickertape_reader_seek_to_end`, C++ and Python `seek_to_end`, Java `seekToEnd`)
+  places a reader at the end of the journal, reading at most the newest segment, from the checkpoint on. A file named
+  like a segment without a valid header where the call starts (for a visible reader the newest name, even an empty or
+  foreign file) is `Error::Corrupt` naming that file, as at `Reader::open`, and a durable-only reader opens no name
+  later than the one that holds the marker's position (issue #112, ADR 0046, note of 2026-11-27; tests for both
+  readers). The C ABI stays at ABI version 1 (an added function).
+- Added (core): the `latency` module (issue #61, ADR 0047, which designs opt-in latency histograms in the library and a
+  `tickertape age` command): `latency::Recorder`, a histogram of durations that one thread records and any thread reads
+  through a `View` without a lock, with exact extremes, quantiles at most 1.6 % above the true value and interval views
+  (`Snapshot::since`); and `latency::RecordAge`, the age of records as a reader returns them, with separate counts for
+  records that are not live, not stamped or stamped ahead of the clock. Nothing is recorded unless the application does
+  it; the readers, the on-disk format and the bindings are unchanged.
+- Added (core): `WriterConfig::latency` with `LatencyMode` (issue #61, ADR 0047), **off by default**, and
+  `Writer::latency`, which returns `latency::WriterLatency`: histograms of the writer's own calls, readable from any
+  thread of its process. `LatencyMode::RollsAndCheckpoints` records rolls and the time from a checkpoint request to its
+  durable marker and leaves an append that does not roll alone; `LatencyMode::All` also times every append and every
+  batch, without sampling. These are service times, not response times. Off, an append gains one test; what the modes
+  cost is in `docs/benchmarks.md` (2026-11-26). The file format, the crash contract and the bindings are unchanged.
+- Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON. By default
+  it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report tells an idle
+  journal from a reader that is not at the end of the journal yet and measured nothing.
+- Added: `WriterConfig::spare_segment` (C `tickertape_writer_options_set_spare_segment`, C++ and Python `spare_segment`,
+  Java `spareSegment`; `tt-sustained` and `tt-latency` `--spare-segment`): on Linux, prepare the next segment in a
+  background thread so that a roll does not create and preallocate a file (ADR 0049, issue #60). **Off by default on
+  Linux**, where the writer behaves as before; on by default on macOS, as today, and now separate from `prefault`. On
+  cloud VMs it made rolls cheaper away from the disk's limit, made the one saturated case worse and was not measured in
+  others. The file format and the crash contract's guarantees are unchanged.
+
+### Changed
+
+- Changed: a safe reader (`Reader::open`) that does not block and keeps showing that it waits for every record reads 4
+  KiB per fill of its buffer instead of 64 KiB, so following a live journal by spinning no longer copies 64 KiB per
+  record (ADR 0052, issue #62). It shrinks after 16 fills in a row that each waited for one record, reads a whole chunk
+  once in 256 fills, and grows back at the first fill that does not wait or brings more than one record. A record the
+  reader blocked for (registered as a waiter, so that the writer made a wake-up call) is always read with a whole chunk:
+  a blocking reader that reads less blocks more often, and the writer pays for each wake-up, so blocking readers read as
+  before. Replay, catch-up, seeks, the first fill of a segment and durable-only readers read whole chunks as before. No
+  record, error or API changes. Measured on cloud VMs (`docs/benchmarks.md`, 2026-11-26): spinning readers at 20,000 and
+  200,000 records/s read 4.4–11.7 KB per record instead of 66–68 KB with p50 halved or better; replay, 1.5 million
+  records/s and blocking readers at 20,000 to 200,000 records/s unchanged, the writer's `append` latency included
+  (x86-64).
+- Changed: a reader waiting at an empty slot no longer reads every later file name without a valid segment header again
+  at each listing (issue #89, ADR 0050 amendment of 2026-11-27). Such names (stray files named like segments) are no
+  evidence, but with 10,000 of them an idle visible reader's `try_next` spent 105–168 ms (macOS) or up to 32 ms (Linux
+  VM) once a second reading them (the issue reported 0.47–0.50 s, which was not reproduced). A listing now reads every
+  new name (or another file at a known name, by its inode number) and at most 256 of the others, the ones read longest
+  ago; the first check after an open or a seek still reads them all. A header written into such a file in place is seen
+  within `ceil(M / 256)` listings (`M` such names; at the next one up to 256, as before; crash contract C11), a segment
+  linked or renamed into place at the next one if its file has another inode number than the stray it replaced,
   otherwise in its turn. A durable-only reader never makes this check while it waits at the marker. Informal, 10,000
-  empty stray names, a call that lists: 105–168 ms → 7.8–20 ms on an Apple M4 Pro, up to 32 ms → up to 7.7 ms in a
-  Linux VM (`docs/benchmarks.md`, 2026-11-27). The record path, `Reader`'s layout and the fill path are unchanged. No
-  API change.
+  empty stray names, a call that lists: 105–168 ms → 7.8–20 ms on an Apple M4 Pro, up to 32 ms → up to 7.7 ms in a Linux
+  VM (`docs/benchmarks.md`, 2026-11-27). The record path, `Reader`'s layout and the fill path are unchanged. No API
+  change.
+- Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds
+  its loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no
+  longer makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with
+  `pread` into a private buffer, with the safe reader's result. This narrows the known limitation of `open_mapped`
+  (`docs/crash-contract.md` → Readers, the writer and memory safety): as long as the journal's markers are intact, a
+  durable-only zero-copy reader is outside it (except for one case that takes two faults, stated there), and a visible
+  one is for slots below the checkpoint position it last took. A reader at the head of the journal gains nothing. A
+  visible zero-copy reader now reads the marker at each segment it opens, when it reaches the marker's position, and ten
+  times a second while it waits. No record, error, API, ABI or on-disk byte changes, and any writer works, 1.0.0
+  included. ADR 0048 (accepted) settles the zero-copy reader's publication frontier; with it, the text of the zero-copy
+  reader's known limitation is corrected (`Reader::open_mapped`, `crash-contract.md`, `compatibility.md`): the damage
+  can appear whether or not a writer runs, it includes the empty slot at the head, and a zeroed commit word is only one
+  of the two cases. No guarantee is weakened: all of this damage breaks the intact chain on which the guarantee depends.
+- Changed: a forward `Reader::seek` within the reader's segment continues from the reader's position instead of reading
+  the segment from its start again, when that position is known to be on the current chain: an earlier seek of the
+  reader read a checkpoint marker that covers it, the segment file is still in place, and the record before it is still
+  there (ADR 0046). It lands on the same record, with two exceptions after storage damage: records before the position,
+  which the reader validated when it passed them, are not validated again; and if damage destroyed the checkpoint
+  marker, or set it back to an older one, together with covered records, the seek may go on from a position that
+  recovery has made invalid (`docs/crash-contract.md` → Readers after a repair). A seek to the last record the reader
+  passed, or an earlier one, scans the segment, and so does a new reader. All bindings get this through the Rust reader.
+- Changed: `inspect::read_checkpoint` (and so each refresh of a durable-only reader) reads the marker's two 64-byte
+  slots instead of the whole 128 KiB file.
+- Changed (CLI): `tail --from-end` uses `Reader::seek_to_end`, so it no longer reads every retained segment, and damaged
+  records in an older segment no longer make it fail (a damaged header of the oldest segment still does).
+- Changed (Python decoder): `read_journal(start_seq=...)` in `python/tickertape_reader.py` starts at the segment that
+  holds `start_seq`, chosen by file name as the Rust reader does, instead of reading every segment from the oldest. It
+  still validates that segment's records before `start_seq`; damage in earlier segments is no longer reported.
+- Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
+  written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
+  without its encryption feature and never wrote such files.
+
+### Fixed
+
+- Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
+  renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a successor
+  after a lost roll) before its link. A power loss right after the rename could keep the new name without the copied
+  records before the checkpoint marker (lost silently in 1.0.0; with the check above, the next open would refuse), and a
+  new journal's first segment without its header made every later open fail. One more `F_FULLFSYNC` per repair and per
+  created segment; Linux was not affected (`fdatasync` flushes the device cache).
+- Fixed: a spare segment that came to nothing (its preparation failed after its blocks were allocated) gives its blocks
+  back even while another descriptor of its file is open, such as the copy a child process forked at that moment holds
+  until it executes its new program. It is truncated before its name is removed, if it has no other name; so are a spare
+  the roll discards, the file a panicked spare thread left, and the temporary file of a segment a roll failed to create.
+  Before, a roll that had run out of space while the spare held it could fail with "no space" when it tried again (Linux
+  with `WriterConfig::spare_segment`), and on macOS the roll's own create that follows a failed spare could. ADR 0049
+  amendment of 2026-11-27; issue #73.
+
+### Documentation
+
+- Docs: charts of the performance results beside their tables, in light and dark variants: in the README the comparison
+  at v1.0.0 (W1 and W3 throughput, W2 reader p99.9, the ten-minute probe; ext4, pinned), and in `docs/benchmarks.md`
+  the same plus the ten-minute paced runs (SV on ext4 and xfs, SD on ext4) and before and after charts with their costs
+  for ADR 0058, ADR 0059 and the seek index. Each run is a point where the tables give a range. The values are in
+  `docs/charts/data/`, checked against the tables by `docs/charts/check_tables.py`; `docs/charts/make.py` draws the
+  SVGs. The README's Performance section has a new "Since 1.0.0" list; no published number or sentence changed.
 - Docs: `docs/operations.md` → "How many segments to keep" (issue #80): what grows with the number of segments (each
   seek's listing, a checkpoint with retention, removals, a writer's open, `max_bytes` planning, `list_segments`), with
   the figures of `docs/benchmarks.md` (2026-11-25, one x86-64 cloud machine), what a run still reads per file, and what
   to do about it. ADR 0046 is amended: there is no cached listing for seeks, and `Reader::seek`'s rustdoc says what a
   seek costs and why.
-
+- Docs: `docs/benchmarks.md` has seeks with and without the seek index on `main` (issue #59): both readers, 64 B and
+  1,024 B, targets at the start, middle and end of a sealed 128 MiB segment and of the newest one, warm and cold,
+  forward seeks, the cost of `tickertape index` and of the writer's open with index files (x86-64 and aarch64 cloud
+  VMs). `docs/operations.md` quotes them.
+- Docs: what the Linux prefault window adds to a checkpoint is measured (issue #62): `docs/benchmarks.md` → "2026-11-26,
+  what prefaulted, unwritten pages add to a checkpoint" (x86-64 and aarch64, ext4 and xfs). `MADV_POPULATE_WRITE` leaves
+  the 256 KiB window dirty, so every checkpoint that covers appends writes it as zeros in the active segment's
+  whole-file `fdatasync` (0.16–0.43 ms) and write-protects it again (about 35 more page faults for the writer per
+  checkpoint); an idle writer pays once. The roadmap, ADR 0025 (a dated note), `docs/operations.md` and
+  `WriterConfig::prefault` say so, and a note corrects the 2026-11-25 "ranged checkpoint sync" experiment, which still
+  wrote the window back. macOS is not measured. No behaviour change (one rustdoc paragraph).
+- Docs: how much of the throughput limit and of the latency tail on the cloud VMs is the disk (issue #60):
+  `docs/benchmarks.md` has `fio` on the same local SSDs (capped at 351 MB/s), the sustained scenarios with the journal
+  on tmpfs, one storage setting at a time, a payload sweep and the two SSDs striped. `docs/operations.md` → Writer
+  threads says how to tell whether the disk is the limit and which settings moved the tail (early write-back off removed
+  the aarch64 stalls at 92 % of the device's rate, at the cost of checkpoints durable after about 0.9 s).
+- Docs: the stalls of sustained runs on ext4 are attributed (issue #60): the write fault's modification-time update and
+  a roll's file operations wait for the ext4 journal; that the holder of `mmap_lock` in the unpaced rolls is the
+  prefault helper is inferred, and why the device queues on one machine shape is not explained. With the measured effect
+  of `lazytime` and the tracing overhead of the eBPF playbook's tools; `benches/diagnostics/stalls.bt` is new.
+- Docs: `docs/benchmarks.md` has profiles of both readers, the notification path and the serialization paths under the
+  sustained workloads (x86-64 and aarch64 cloud VMs) and lists the allocations, copies, system calls and synchronization
+  that remain, with whether each is necessary (issue #62; roadmap "Finish eliminating avoidable work").
+- Docs: the 1.0.0 gap "replay and recovery at scale" is measured (issue #62): results of 2026-11-25 in
+  `docs/benchmarks.md`, with the limits the segment count sets in `docs/operations.md`, ADR 0042 and the roadmap.
+- Docs: `docs/benchmarks.md` records the investigation of the two aarch64 observations left open by 1.0.0 (issues #60
+  and #62): the zero-copy reader's 10 ms maximum of the checkpoint runs did not reproduce on new Axion VMs and is not
+  explained; the lagging view of issue #43 still occurs on `main` under memory pressure, is cleared by the first re-read
+  after a pause, and coincides in part with reclaim removing the frame's pages (not confirmed). Added (benchmarks):
+  `benches/diagnostics/reader-pauses.bt` and `benches/diagnostics/frontier-evictions.bt`.
+- Docs: `docs/benchmarks.md` has macOS results for three open items (issues #62 and #60; Apple M4 Pro, APFS, a shared
+  laptop): the sustained session with 10-minute steady runs at both payloads (the writer keeps half the probe rate but
+  falls up to 1.5 s behind at rolls; at 90 % of the 1,024 B probe it stops at the overrun limit) and a comparison with
+  Chronicle Queue and Aeron at identical low rates; how often a roll waits for the spare segment (only near the device's
+  limit; mostly for the spare's 8 MiB prefault, longest for its `fsync` behind a checkpoint) and the two other causes of
+  slow rolls found on the way (the spare's `link` behind a checkpoint's syncs, and the release of the oldest of four
+  open dirty segments on the writer's thread); and what prefaulted, unwritten data adds to a checkpoint (on APFS
+  `MADV_WILLNEED` dirties the advised pages, so each checkpoint writes up to 8 MiB of zeros more). The roadmap's gaps
+  are updated. No library change.
 - Docs: the comparison with Chronicle Queue, Aeron IPC, yaque, queue-file and a plain file is rerun at v1.0.0 with the
   corrected harness (issue #57): one 24-hour session on each of two Google Cloud VMs (x86-64 and aarch64, ext4 and xfs),
   session commit `fb2d91b0`, every tool pinned, the JVM tools warmed up through their measured loops, Chronicle with
@@ -116,220 +369,47 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
   says that readers never slow the writer down (a blocking reader costs the writer a wake-up call when it publishes),
   explains the disk's 351 MB/s limit and what removed the aarch64 stalls near it, and states what a checkpoint syncs on
   Linux and macOS. No code change.
-- Fixed (benchmarks): the comparison harness's cleanup gave the 3 s grace period after SIGTERM only to each child's
-  leader: once the leaders had exited, SIGKILL went to their groups at once, so another process in a group (as
-  `tt-latency` has) could be killed before it had ended, and a group whose leader had already exited was not
-  signalled at all. Every process of every group now gets SIGTERM and the grace period, in the runner and in
-  `benches/rerun.py`, and the guard keeps a group until it is empty. Seen as a flaky test on the macOS CI leg. Nothing
-  measured changes.
-- Fixed (benchmarks): the comparison harness's short mode left the Chronicle Queue and Aeron JVMs (and `tt-latency`'s
-  processes) running when it was terminated. `compare/run.py` now ends every child's process group, waits for it and
-  renames an unfinished short run `OUTDIR.incomplete-N` on every way out (failure, time limit, SIGTERM, SIGINT,
-  SIGHUP), and a guard process does the same if the runner or `benches/rerun.py` is killed with SIGKILL. The adapters
-  keep the sessions of their own they had; `tt-latency` stays in the runner's session with its output on a pipe, as at
-  v1.0.0, and only gains a process group of its own, so no measured process runs differently. The harness now needs
-  Python 3.11. The short mode has `--tools`, with the same output as a full run for the selected tools and a new
-  `selected_tools` field in every result; `benches/rerun.py` uses it. No library change.
+- Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs in
+  the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the 10-minute
+  comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
+- Docs: corrections to benchmark notes, with no new measurement (issue #58). The README and `docs/benchmarks.md` say how
+  Chronicle Queue was configured (defaults, no page pre-touching) and that tickertape's first segment is preallocated
+  before the append timer starts, and that tickertape's prefaulting was on; that at 1,024 bytes and 100,000 records/s
+  the zero-copy reader's p99.9 is around Chronicle Queue's, not below it, and on ext4 above it with prefaulting off; and
+  that the recorded seeks to the last record cross about half a segment. The "Not measured" list of v0.1.0 says what was
+  measured later. ADRs 0025 and 0042 have notes.
+- Docs: `docs/operations.md` describes how to move a tape to another machine.
+- Docs: `docs/benchmarks.md` → "2026-11-27, release 1.1.0 against 1.0.0" has the release checklist's two checks against
+  1.0.0 (x86-64 and aarch64 cloud VMs, 10 interleaved rounds with a second copy of 1.0.0 as the noise floor). Append
+  path: the writer's p50, p99 and p99.9 are lower, the durable-only reader's CPU and context switches fall by two orders
+  of magnitude (ADR 0053), and the writer's maximum, a roll, is higher (consistent with ADR 0058, above). Replay: level
+  at 1,024 B; at 64 B the gate measured both readers about 1 % slower than 1.0.0 on aarch64 (1.009 and 1.012, slower in
+  9 and 10 of 10 rounds; the copy 1.003 and 1.008) and the safe reader 2.8 % slower than the copy on x86-64 (8 of 10
+  rounds). A second session per architecture, the same byte-identical binaries and the record path's nine intermediate
+  states, 16 rounds each, did not reproduce it: `main` against 1.0.0 is 1.002 (zero-copy) and 1.0005 (safe) on aarch64
+  (copy 1.003 and 0.9995) and 0.972 and 0.999 on x86-64 (copy 0.990 and 1.001), and the states move by up to 1.5 %
+  (aarch64) and 5 % (x86-64) from one to the next in both directions with no step that stays to `main`. So no change on
+  the record path is a measured replay cost of 1.1; the gate's figures came with its session.
+
+### Benchmarks, tests and tooling
+
 - Added (benchmarks): `tt-faults` counts the page faults of the writer's thread append by append, with paced appends,
   background checkpoints and a zero-copy reader, and `benches/diagnostics/writer-faults.bt` classifies them (ADR 0058,
-  issue #60, proposed). The library does not change; the experiment switches the measurements used are on the branch
-  `exp/prefault-residual`, which is never merged.
-- Fixed: a reader replayed 15 to 30 % slower, on Linux x86-64 and aarch64, when it happened to sit in memory so that a
-  page boundary fell inside the record it decodes into: the record path stores and loads that record 16 bytes at a
-  time, and such an access split across two pages is slow (ADR 0057, issue #86; present since 1.0.0). About one process
-  in 200 of the benchmarks hit it by chance. `Reader` now has a fixed layout, `#[repr(C, align(16))]` in the order rustc
-  had chosen, so that no such access can straddle a page and the record path compiles as before; a test pins the
-  layout, and the release checklist runs the replay benchmark against the previous release on both architectures. No
-  API or ABI change (`size_of::<Reader>()` is 464 bytes instead of 456). The slowdown seen on an Apple M4 Pro in #85 was
-  not measured again.
-- Changed (tests): the seek index tests that create index files for readers give them mode 0644 whatever the umask.
-  Under a umask of 0002 (Ubuntu's for a login whose group has its name, as on the cloud machines of the benchmarks) the
-  files were group-writable, which readers rightly ignore (ADR 0045, step 3), so five tests failed there and passed in
-  CI. A new test runs two of them under umask 0002. The wake-up test hooks (`mmap::test_hooks`) count per thread, so a
-  reader of another test that blocks meanwhile no longer counts as the tested reader's registration. No library change.
-- Docs: what the Linux prefault window adds to a checkpoint is measured (issue #62): `docs/benchmarks.md` → "2026-11-26,
-  what prefaulted, unwritten pages add to a checkpoint" (x86-64 and aarch64, ext4 and xfs). `MADV_POPULATE_WRITE` leaves
-  the 256 KiB window dirty, so every checkpoint that covers appends writes it as zeros in the active segment's whole-file
-  `fdatasync` (0.16–0.43 ms) and write-protects it again (about 35 more page faults for the writer per checkpoint); an
-  idle writer pays once. The roadmap, ADR 0025 (a dated note), `docs/operations.md` and `WriterConfig::prefault` say so,
-  and a note corrects the 2026-11-25 "ranged checkpoint sync" experiment, which still wrote the window back. macOS is
-  not measured. No behaviour change (one rustdoc paragraph).
-- Changed: a safe reader (`Reader::open`) that does not block and keeps showing that it waits for every record reads
-  4 KiB per fill of its buffer instead of 64 KiB, so following a live journal by spinning no longer copies 64 KiB per
-  record (ADR 0052, issue #62). It shrinks after 16 fills in a row that each waited for one record, reads a whole chunk
-  once in 256 fills, and grows back at the first fill that does not wait or brings more than one record. A record the
-  reader blocked for (registered as a waiter, so that the writer made a wake-up call) is always read with a whole chunk:
-  a blocking reader that reads less blocks more often, and the writer pays for each wake-up, so blocking readers read as
-  before. Replay, catch-up, seeks, the first fill of a segment and durable-only readers read whole chunks as before. No
-  record, error or API changes. Measured on cloud VMs (`docs/benchmarks.md`, 2026-11-26): spinning readers at 20,000
-  and 200,000 records/s read 4.4–11.7 KB per record instead of 66–68 KB with p50 halved or better; replay, 1.5 million
-  records/s and blocking readers at 20,000 to 200,000 records/s unchanged, the writer's `append` latency included
-  (x86-64).
-- Fixed: an archiver (`retention::apply`, `tickertape archive`) could remove the checkpoint marker's segment, leaving a
-  dangling marker that a writer refuses, when the marker was lost, the oldest segment damaged and a writer recovered
-  between the archiver's checks of that segment and its removal (issue #83, ADR 0055; present since 1.0.0). An archiver
-  now takes the segment out of the journal with a no-replace rename, checks that it took the file it checked and that
-  the marker, read again, names a later segment (for a move by copy, also that the file still holds what was copied),
-  and only then lets it go; otherwise it renames it back and stops with the error. A writer's own retention run, which
-  holds the writer lock, is unchanged. **Behaviour changes:** a deletion, and a move by copy, now go through a temporary
-  name in the journal directory, `{base:020}.tape.{pid}.{unix_ns}.removing` (`docs/format.md`), which a crash can leave
-  behind. Readers, writers and `verify` ignore it (1.0.0 included); `status` (`removal_leftovers`) and `archive`
-  (`report.leftovers`; `retention::Report::leftovers`) report it. It may hold records the journal no longer has, so a
-  later retention run unlinks it only once retention has removed the segment its seal names (and its name is an hour
-  old and its process gone); `docs/operations.md` says how to keep it or put it back. An archiver's removal costs a
-  rename, a `stat` and a read of the marker more than before.
-- Fixed: `Writer::open` refuses a checkpoint marker whose position the records of its segment do not reach (ADR 0056,
-  issue #87). The record right before the marker's offset must be there, valid, end exactly at that offset and carry
-  the sequence number below the marker's `next_seq` (at offset 64, `next_seq` must be the segment's base). Otherwise the
-  open fails under every recovery policy with `Error::Corrupt`, reason `DanglingCheckpoint` (C ABI code 13, Python
-  `dangling_checkpoint`), reported at the segment and the marker's offset, before anything is changed. **Behaviour
-  change:** 1.0.0 opened such a journal, continued at the marker's position and made the gap below it permanent. Two
-  kinds of journal are refused now: segments restored from a backup while a newer `checkpoint` file was kept (restore
-  the backup's marker with them: `docs/operations.md` → Restoring from a backup), and a journal whose last record before
-  the marker's offset, in the marker's segment, is zeroed or damaged (`verify` already reported it). Damage to any earlier
-  covered record is not looked at, as before. No journal that a working writer and a crash leave on storage that honours
-  its syncs is refused. What to do after a refusal: `docs/operations.md` → After a crash. The check reads only the record
-  before the marker: on a healthy journal it adds work proportional to that record's length.
-- Fixed: `tickertape status` (`status::status`, `Sampler`) predicts that refusal, and retention removes nothing from
-  such a journal (ADR 0056, amendment; issue #93). The sample runs the writer's own check on the record before the
-  marker's offset and reports the new `checkpoint.problem` value `dangling` (`CheckpointProblem::Dangling`,
-  C ABI `TICKERTAPE_CHECKPOINT_DANGLING` = 4, C++ `dangling`, Java `DANGLING`, Python
-  `"dangling"`): exit 2, `checkpoint_invalid`, `tickertape_healthy` 0, as for the other values. 1.0 reported most
-  of these journals as healthy. Those that 1.0 already reported as corrupt, through `head_invalid` with `problem` null
-  (a marker in the newest segment whose `next_seq` or offset disagrees with the records there), keep exit code 2 and now
-  also report `checkpoint_invalid` and `problem` `dangling` (`tickertape_checkpoint_invalid` 0 → 1). A retention run (the writer's own, `retention::plan` and `apply`, `tickertape archive`,
-  `--dry-run` included) fails with the writer's error, `DanglingCheckpoint` at the segment and the marker's offset, and
-  removes nothing, so the segments that restoring the matching marker needs stay; 1.0 removed the segments before the
-  marker's. Each costs one more read, of that record (normally one 4 KiB `pread`; for retention once per run).
-  **Behaviour change:** from 1.1 the sets of `status` `checkpoint.problem` values and of breach codes may grow in a minor
-  release (`docs/cli.md`): treat a code you do not know as a problem. Not detected, by decision: a marker at offset 64
-  whose previous segment lacks records (the ADR's amendment says why; `verify` and readers report it).
-- Fixed (macOS): a repair by replacement makes its copy of the segment durable on the drive (`F_FULLFSYNC`) before it
-  renames the copy over the segment, and so does a segment recovery creates (a new journal's first segment, a
-  successor after a lost roll) before its link. A power loss right after the rename could keep the new name without
-  the copied records before the checkpoint marker (lost silently in 1.0.0; with the check above, the next open would
-  refuse), and a new journal's first segment without its header made every later open fail. One more `F_FULLFSYNC`
-  per repair and per created segment; Linux was not affected (`fdatasync` flushes the device cache).
-- Changed: a durable-only reader that blocks at the checkpoint boundary is woken by checkpoints only, not by every append
-  (ADR 0053, issue #82). Checkpoints bump an event count of their own in the wake-up region, and a capability word says
-  which writers do. Since #66 made the reader's marker check fast, such a reader slept between appends and the writer
-  made a wake-up system call for almost every record (append p50 0.54 → 0.75 µs on aarch64, 0.56 → 1.20 µs on x86-64,
-  against 1.0.0); now appends make none for it, and are faster than 1.0.0's with such a reader (p50 0.30 against 0.51 µs
-  on aarch64, 0.44 against 0.56 µs on x86-64; `docs/benchmarks.md`, 2026-11-26). Beside a 1.0.0 writer, which does not bump those words, a durable-only
-  reader polls the marker every `Backoff::max_sleep` (1 ms by default) instead of registering, so that writer pays
-  nothing for it either; a 1.0.0 durable-only reader beside a new writer waits as before. The last records of a large
-  backlog can reach a durable-only reader up to about 2 ms later than a reader that polls the marker when the writer's helper threads share its
-  CPU (`WriterConfig::helper_cpus` avoids it). The `notify` record, the on-disk format, the API and the ABI do not
-  change; every pairing of 1.0.0 and new processes works (`tests/compat/v1.0.0-wake-ups.sh`).
-- Docs: the release checklist compares the append path with the previous release in `tt-sustained` with a durable-only
-  blocking reader, the case that the micro-benchmark and `tt-latency` miss (issue #82).
-
-- Fixed: a reader no longer stops silently at a zeroed commit word in older history (issue #79, ADR 0050). An empty slot
-  that the checkpoint marker covers, or that a later segment (with a valid header) shows to have been filled, is `Error::Corrupt` with
-  `CorruptReason::EmptyCommitWord` at its offset; before, `try_next` returned `Ok(None)` there for ever, and a replay ended
-  without an error. **What callers see changes:** an error where a wait was. It comes in the call that meets the first
-  empty slot after opening or seeking, otherwise after at most 100 ms at the slot (1.1 s if only a later segment shows
-  it), plus 50 ms in which the slot is read again; it is returned on every call, since no reader gets past it. `export`,
-  `stats`, `tail` and `age` exit 2 where they ended with 0, and `export --durable-only` names the damage instead of
-  "journal changed". After a repair in place, a visible reader whose position is inside a record of the new history gets
-  `Error::Discarded` where it waited until it was seeked. `verify` also reports a newest segment that ends before what the
-  marker covers, and the pure-Python decoder, with `durable_only`, an empty slot below the marker. Not detected: a zeroed
-  word that nothing covers, such as in the newest segment at or after the marker (`docs/crash-contract.md`, C11). A waiting
-  reader now reads the marker ten times a second and lists the segments when the directory has changed, at most once a
-  second; the record path, the C ABI's declarations and the on-disk format are unchanged, and any writer works, 1.0.0
-  included.
-- Changed: retention reads only what its policy needs and lists the journal directory once per run (ADR 0051, issue #80).
-  A checkpoint with a policy used to open every segment; now `max_segments` needs the file names, `max_age` the headers of
-  the oldest segments, and `max_bytes` the file sizes (which a writer keeps between its runs) and the headers of the files
-  whose size nothing else confirms (in a journal of one segment size, the newest). Removing a segment no longer lists the
-  directory. The segments removed are the same. **Behaviour changes:**
-  - An invalid header, or a file that cannot be opened, in a segment the policy does not need no longer makes retention,
-    `retention::plan` and `tickertape archive` fail (1.0.0 documented that `plan` read every header). It still does in the
-    segments to remove, the one after them and the marker's, with `max_age` the first that stays and its successor, and
-    with `max_bytes` the files whose headers it reads. Run `tickertape verify` to find damage.
-  - With `max_bytes`, a file as long as the one before it counts with its length, also if its header names another size
-    (1.0.0 failed there).
-  - A segment found missing in the middle of the chain during a removal, in a race with its removal by hand, is reported
-    as `Error::Corrupt` (`BrokenChain`), where it could be an `Error::Io` ("not found").
-  - An I/O error on the marker during `retention::apply` is returned even when another archiver has just removed that
-    segment.
-  - Do not put segment files back into a journal while retention runs on it.
-- Changed (tests): `retention_kill_loop_50` kills the archiver inside runs of several removals, at delays scaled to how
-  long a move takes on the machine, instead of within 5 ms (issue #73).
-- Docs: `docs/benchmarks.md` has seeks with and without the seek index on `main` (issue #59): both readers, 64 B and
-  1,024 B, targets at the start, middle and end of a sealed 128 MiB segment and of the newest one, warm and cold,
-  forward seeks, the cost of `tickertape index` and of the writer's open with index files (x86-64 and aarch64 cloud
-  VMs). `docs/operations.md` quotes them.
-- Docs: `docs/operations.md` → Open files states how many files a writer can hold open (ADR 0054, issue #73). The
-  guarantee in 1.x is that the count is bounded, whatever the number of segments and however far its background
-  checkpoints fall behind; in this release it is at most 18, 19 on Linux by default and 20 on Linux with the spare
-  segment (raised by two on Linux by ADR 0059, above), and a later 1.x release that raises it says so here. A checkpoint now closes each segment it reopens before it opens the
-  next, which lowered that number by one. The descriptor tests of `tests/open_segments.rs` reach the worst case with hold
-  points (new: `fault::Point::CheckpointReopen`, and `fault::Point::EarlyWriteback` as a hold point) instead of
-  depending on machine load, and the spare-segment one is no longer ignored.
-- Changed: the zero-copy reader (`Reader::open_mapped`, and the mapped readers of the C, C++ and Java bindings) bounds its
-  loads by the checkpoint marker (ADR 0048, issue #62). A damaged length in a record that the marker covers no longer
-  makes it load bytes past the marker's position, where a writer may be storing: such a frame is read with `pread` into a
-  private buffer, with the safe reader's result. This narrows the known limitation of `open_mapped`
-  (`docs/crash-contract.md` → Readers, the writer and memory safety): as long as the journal's markers are intact, a
-  durable-only zero-copy reader is outside it (except for one case that takes two faults, stated there), and a visible
-  one is for slots below the checkpoint position it last took.
-  A reader at the head of the journal gains nothing. A visible zero-copy reader now reads the marker at each segment it
-  opens, when it reaches the marker's position, and ten times a second while it waits. No record, error, API, ABI or
-  on-disk byte changes, and any writer works, 1.0.0 included.
-- Added: `WriterConfig::spare_segment` (C `tickertape_writer_options_set_spare_segment`, C++ and Python `spare_segment`,
-  Java `spareSegment`; `tt-sustained` and `tt-latency` `--spare-segment`): on Linux, prepare the next segment in a
-  background thread so that a roll does not create and preallocate a file (ADR 0049, issue #60). **Off by default on
-  Linux**, where the writer behaves as before; on by default on macOS, as today, and now separate from `prefault`. On
-  cloud VMs it made rolls cheaper away from the disk's limit, made the one saturated case worse and was not measured in others. The
-  file format and the crash contract's guarantees are unchanged.
-- Docs: how much of the throughput limit and of the latency tail on the cloud VMs is the disk (issue #60):
-  `docs/benchmarks.md` has `fio` on the same local SSDs (capped at 351 MB/s), the sustained scenarios with the journal
-  on tmpfs, one storage setting at a time, a payload sweep and the two SSDs striped. `docs/operations.md` → Writer threads
-  says how to tell whether the disk is the limit and which settings moved the tail (early write-back off removed the
-  aarch64 stalls at 92 % of the device's rate, at the cost of checkpoints durable after about 0.9 s).
-- Docs: the stalls of sustained runs on ext4 are attributed (issue #60): the write fault's modification-time update and
-  a roll's file operations wait for the ext4 journal; that the holder of `mmap_lock` in the unpaced rolls is the prefault
-  helper is inferred, and why the device queues on one machine shape is not explained. With the measured effect of
-  `lazytime` and the tracing overhead of the eBPF playbook's tools; `benches/diagnostics/stalls.bt` is new.
-- Docs: `docs/benchmarks.md` has profiles of both readers, the notification path and the serialization paths under
-  the sustained workloads (x86-64 and aarch64 cloud VMs) and lists the allocations, copies, system calls and
-  synchronization that remain, with whether each is necessary (issue #62; roadmap "Finish eliminating avoidable work").
+  issue #60; its change 1 is accepted and the default from 1.1, its change 2 is still proposed). The library does not
+  change; the experiment switches the measurements used are on the branch `exp/prefault-residual`, which is never
+  merged.
 - Added (benchmarks): `benches/diagnostics/profile-sustained.sh` profiles the threads of a sustained run or counts their
   system calls and heap allocations; `tt-sustained` has `--encode` (how payloads are made) and the reader option
   `owned`. `tests/allocation.rs` checks that appending, following and replaying allocate nothing per record.
-- Added: seek indexes (ADR 0045, crash contract C15). `tickertape index <DIR>` (library: `seek_index::build`, `check`,
-  `remove`) writes a small file per sealed segment into `seek-index/` of the journal, and a reader opened with
-  `ReaderConfig::seek_index(true)` (C `tickertape_reader_options_set_seek_index`, C++ and Python `seek_index`, Java
-  `seekIndex`, CLI `--seek-index` of `tail`, `export` and `stats`) starts a seek in such a segment less than 64 KiB of
-  records before the target. Off by default: records before the place a seek lands on are then not read, so damage there
-  no longer stops the reader, and a forged index can mislead it. Segments of the recovery domain and the newest segment
-  have no index. The on-disk format stays version 1, released versions ignore the files (except that 1.0.0's
-  `export --output` fails if it cannot list the directory), and the C ABI stays at ABI version 1 (an added function).
-- Fixed (seek indexes, unreleased): `seek_index::build` also removes an index it has just published if it cannot check,
-  for another reason than "not found", that the segment is still in place; it reported `Failed` and left the index.
-- Added: `RecoveryReport::seek_indexes_removed` and `seek_index_errors`. When it opens, the writer removes the seek
-  indexes of segments that recovery may change (`docs/format.md` → Recovery, step 2a), best effort; retention and
-  `archive` remove a segment's index after the segment. Without a `seek-index/` directory this is one failed `open` each.
-- Changed (CLI): the alias check of `export --output` no longer descends into `seek-index/`.
-- Changed: a forward `Reader::seek` within the reader's segment continues from the reader's position instead of
-  reading the segment from its start again, when that position is known to be on the current chain: an earlier seek
-  of the reader read a checkpoint marker that covers it, the segment file is still in place, and the record before it
-  is still there (ADR 0046). It lands on the same record, with two exceptions after storage damage: records before the
-  position, which the reader validated when it passed them, are not validated again; and if damage destroyed the
-  checkpoint marker, or set it back to an older one, together with covered records, the seek may go on from a position
-  that recovery has made invalid (`docs/crash-contract.md` → Readers after a repair). A seek to the last record the
-  reader passed, or an earlier one, scans the segment, and so does a new reader. All bindings get this through the Rust reader.
-- Changed: `inspect::read_checkpoint` (and so each refresh of a durable-only reader) reads the marker's two 64-byte
-  slots instead of the whole 128 KiB file.
-- Added: `Reader::seek_to_end` (C `tickertape_reader_seek_to_end`, C++ and Python `seek_to_end`, Java `seekToEnd`)
-  places a reader at the end of the journal, reading at most the newest segment, from the checkpoint on. The C ABI
-  stays at ABI version 1 (an added function).
-- Changed (CLI): `tail --from-end` uses it, so it no longer reads every retained segment, and damaged records in an
-  older segment no longer make it fail (a damaged header of the oldest segment still does).
-- Changed (Python decoder): `read_journal(start_seq=...)` in `python/tickertape_reader.py` starts at the segment that
-  holds `start_seq`, chosen by file name as the Rust reader does, instead of reading every segment from the oldest. It
-  still validates that segment's records before `start_seq`; damage in earlier segments is no longer reported.
+- Added (benchmarks): `tt-append-cost` (instructions per append, and the parts of a timed append), the `append/latency`
+  group of the `append` benchmark, and `tt-latency --writer-latency` and `--snapshot-ms`.
+- Bench: `tt-scale` measures the zero-copy reader, journals of 10,000 segments and more under a low limit on open files,
+  seeks with seek indexes, archived history (`tt-scale archive`), missing and corrupt segments (`tt-scale damage`, which
+  checks after every writer open that no committed record is lost) and catch-up under a live writer (`tt-scale
+  catch-up`); `benches/scale-session.sh` runs the recorded session. No library change.
+- Added (benchmarks): `tt-sustained --count-clock-backwards`: a reader sample whose wall clock reads earlier than the
+  record's send time is recorded as 0 and counted (`clock_backwards_samples`, `clock_backwards_max_ns`) instead of
+  failing the run, which on macOS happened within a minute at 64 B. Without the option a run fails as before.
 - Added (comparison harness): writer and reader threads are pinned on Linux, the same way for every tool, and every
   other thread is kept off their CPUs (`--writer-cpu`, `--reader-cpu`, `--helper-cpus`, automatic choice from the
   topology, `--no-pin` for the old behaviour). Every result records the affinity read back from `/proc`, and a pinned
@@ -342,82 +422,54 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 - Added (benchmarks): `benches/rerun.py` and `benches/rerun-vm.sh` run the parts of the comparison rerun at v1.0.0
   (issue #57) on one machine, interleaved, resumable and restarted after a reboot into isolated CPUs;
   `docs/playbooks/rerun-comparison.md` is the plan. No benchmark results.
-- Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
-  after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the
-  crates were published; rerunning the job completed the release). It now asks for up to a minute.
-- Fixed (release tooling): the `verify-cli` job of the v1.0.0 run saw only the previous version of `tickertape-cli`
-  on PyPI for its five minutes of retries, although the upload had succeeded. It now installs without pip's cache
-  and retries for ten minutes.
-- Added: the v1.0.0 compatibility fixtures (macOS and Linux aarch64), written by the released version (ADR 0033).
-- Docs: the README's Performance section now says that the bare-metal append and replay figures come from short runs
-  in the page cache (31–37 ms for tickertape's append), names the reader behind each latency figure, and adds the
-  10-minute comparison on cloud VMs from `docs/benchmarks.md`. No figure changed and nothing new was measured.
 - Changed (comparison harness): Chronicle and Aeron in `compare/` follow their own documentation (issue #56, ADR 0018
   amendment). Chronicle's `blockSize` is 1 GiB and its writer calls `microTouch()` in the busy-wait (the pretoucher is
-  Enterprise-only); Aeron's term buffers are not sparse and its clients pre-touch mapped memory. Aeron's reader uses
-  one fragment handler instead of a lambda per poll, which changes the measured reader. The JVM tools warm up across
-  index arrays, chunks, terms and the histogram branch in every workload, on scratch data, before the writer opens the
+  Enterprise-only); Aeron's term buffers are not sparse and its clients pre-touch mapped memory. Aeron's reader uses one
+  fragment handler instead of a lambda per poll, which changes the measured reader. The JVM tools warm up across index
+  arrays, chunks, terms and the histogram branch in every workload, on scratch data, before the writer opens the
   measured endpoint, and the paced writer's state exists before its start time. Every Java process logs GC, safepoints,
   handshakes, compilations, deoptimisations and late sends beside the results (`compare/attribute.py` joins them). Each
   can be switched off and is recorded in the result under `java`. No published figure changed and nothing new was
   measured.
-- Docs: corrections to benchmark notes, with no new measurement (issue #58). The README and `docs/benchmarks.md` say
-  how Chronicle Queue was configured (defaults, no page pre-touching) and that tickertape's first segment is
-  preallocated before the append timer starts, and that tickertape's prefaulting was on; that at 1,024 bytes and
-  100,000 records/s the zero-copy reader's p99.9 is around Chronicle Queue's, not below it, and on ext4 above it with
-  prefaulting off; and that the recorded seeks to the last record cross about
-  half a segment. The "Not measured" list of v0.1.0 says what was measured later. ADRs 0025 and 0042 have notes.
-- Docs: `docs/operations.md` describes how to move a tape to another machine.
-- Changed (CLI, dependencies): `Cargo.lock` moves parquet from 59.3.2 to 59.3.3 for RUSTSEC-2026-0595 (bloom filters
-  written in plaintext into encrypted Parquet files), which `cargo deny` started to report. The CLI builds parquet
-  without its encryption feature and never wrote such files.
-- Docs: ADR 0045 (accepted) designs a sparse, rebuildable seek index next to sealed segments (issue #59), built as above.
-- Added (core): the `latency` module (from 1.1, issue #61), the first two steps of the new ADR 0047, which designs
-  opt-in latency histograms in the library and a `tickertape age` command (the third step, histograms in the writer, is
-  the next entry): `latency::Recorder`, a histogram of durations that one thread records and any thread reads through a `View` without a lock, with exact extremes,
-  quantiles at most 1.6 % above the true value and interval views (`Snapshot::since`); and `latency::RecordAge`, the
-  age of records as a reader returns them, with separate counts for records that are not live, not stamped or stamped
-  ahead of the clock. Nothing is recorded unless the application does it; the readers, the on-disk format and the
-  bindings are unchanged.
-- Added (core): `WriterConfig::latency` with `LatencyMode` (from 1.1, issue #61, the third step of ADR 0047), **off by
-  default**, and `Writer::latency`, which returns `latency::WriterLatency`: histograms of the writer's own calls, readable
-  from any thread of its process. `LatencyMode::RollsAndCheckpoints` records rolls and the time from a checkpoint request
-  to its durable marker and leaves an append that does not roll alone; `LatencyMode::All` also times every append and
-  every batch, without sampling. These are service times, not response times. Off, an append gains one test; what the
-  modes cost is in `docs/benchmarks.md` (2026-11-26). The file format, the crash contract and the bindings are unchanged.
-- Added (benchmarks): `tt-append-cost` (instructions per append, and the parts of a timed append), the `append/latency`
-  group of the `append` benchmark, and `tt-latency --writer-latency` and `--snapshot-ms`.
-- Added (CLI): `tickertape age` follows a live journal from its end and reports record ages as text or JSON (from 1.1).
-  By default it polls, so that it never makes the watched writer's appends wake it (`--wait`). `live` in each report
-  tells an idle journal from a reader that is not at the end of the journal yet and measured nothing.
-- Docs: ADR 0048 (accepted; built as above) settles the zero-copy reader's publication frontier (issue #62). With it, the
-  text of the zero-copy reader's known limitation is corrected (`Reader::open_mapped`, `crash-contract.md`,
-  `compatibility.md`): the damage can appear whether or not a writer runs, it includes the empty slot at the head, and a
-  zeroed commit word is only one of the two cases. No behaviour changes and no guarantee is weakened: all of this damage
-  breaks the intact chain on which the guarantee depends.
-- Bench: `tt-scale` measures the zero-copy reader, journals of 10,000 segments and more under a low limit on open files,
-  seeks with seek indexes, archived history (`tt-scale archive`), missing and corrupt segments (`tt-scale damage`,
-  which checks after every writer open that no committed record is lost) and catch-up under a live writer
-  (`tt-scale catch-up`); `benches/scale-session.sh` runs the recorded session. No library change.
-- Docs: the 1.0.0 gap "replay and recovery at scale" is measured (issue #62): results of 2026-11-25 in
-  `docs/benchmarks.md`, with the limits the segment count sets in `docs/operations.md`, ADR 0042 and the roadmap.
-- Docs: `docs/benchmarks.md` records the investigation of the two aarch64 observations left open by 1.0.0 (issues #60
-  and #62): the zero-copy reader's 10 ms maximum of the checkpoint runs did not reproduce on new Axion VMs and is not
-  explained; the lagging view of issue #43 still occurs on `main` under memory pressure, is cleared by the first
-  re-read after a pause, and coincides in part with reclaim removing the frame's pages (not confirmed). Added
-  (benchmarks): `benches/diagnostics/reader-pauses.bt` and `benches/diagnostics/frontier-evictions.bt`.
-- Docs: `docs/benchmarks.md` has macOS results for three open items (issues #62 and #60; Apple M4 Pro, APFS, a shared
-  laptop): the sustained session with 10-minute steady runs at both payloads (the writer keeps half the probe rate but
-  falls up to 1.5 s behind at rolls; at 90 % of the 1,024 B probe it stops at the overrun limit) and a comparison with
-  Chronicle Queue and Aeron at identical low rates; how often a roll waits for the spare segment (only near the device's
-  limit; mostly for the spare's 8 MiB prefault, longest for its `fsync` behind a checkpoint) and the two other causes of
-  slow rolls found on the way (the spare's `link` behind a checkpoint's syncs, and the release of the oldest of four
-  open dirty segments on the writer's thread); and what prefaulted, unwritten data adds to a checkpoint (on APFS
-  `MADV_WILLNEED` dirties the advised pages, so each checkpoint writes up to 8 MiB of zeros more). The roadmap's gaps
-  are updated. No library change.
-- Added (benchmarks): `tt-sustained --count-clock-backwards`: a reader sample whose wall clock reads earlier than the
-  record's send time is recorded as 0 and counted (`clock_backwards_samples`, `clock_backwards_max_ns`) instead of
-  failing the run, which on macOS happened within a minute at 64 B. Without the option a run fails as before.
+- Fixed (benchmarks): the comparison harness's cleanup gave the 3 s grace period after SIGTERM only to each child's
+  leader: once the leaders had exited, SIGKILL went to their groups at once, so another process in a group (as
+  `tt-latency` has) could be killed before it had ended, and a group whose leader had already exited was not signalled
+  at all. Every process of every group now gets SIGTERM and the grace period, in the runner and in `benches/rerun.py`,
+  and the guard keeps a group until it is empty. Seen as a flaky test on the macOS CI leg. Nothing measured changes.
+- Fixed (benchmarks): the comparison harness's short mode left the Chronicle Queue and Aeron JVMs (and `tt-latency`'s
+  processes) running when it was terminated. `compare/run.py` now ends every child's process group, waits for it and
+  renames an unfinished short run `OUTDIR.incomplete-N` on every way out (failure, time limit, SIGTERM, SIGINT, SIGHUP),
+  and a guard process does the same if the runner or `benches/rerun.py` is killed with SIGKILL. The adapters keep the
+  sessions of their own they had; `tt-latency` stays in the runner's session with its output on a pipe, as at v1.0.0,
+  and only gains a process group of its own, so no measured process runs differently. The harness now needs Python 3.11.
+  The short mode has `--tools`, with the same output as a full run for the selected tools and a new `selected_tools`
+  field in every result; `benches/rerun.py` uses it. No library change.
+- Changed (tests): the seek index tests that create index files for readers give them mode 0644 whatever the umask.
+  Under a umask of 0002 (Ubuntu's for a login whose group has its name, as on the cloud machines of the benchmarks) the
+  files were group-writable, which readers rightly ignore (ADR 0045, step 3), so five tests failed there and passed in
+  CI. A new test runs two of them under umask 0002. The wake-up test hooks (`mmap::test_hooks`) count per thread, so a
+  reader of another test that blocks meanwhile no longer counts as the tested reader's registration. No library change.
+- Changed (tests): `retention_kill_loop_50` kills the archiver inside runs of several removals, at delays scaled to how
+  long a move takes on the machine, instead of within 5 ms (issue #73).
+- Added: the v1.0.0 compatibility fixtures (macOS and Linux aarch64), written by the released version (ADR 0033).
+- Docs: the release checklist compares the append path with the previous release in `tt-sustained` with a durable-only
+  blocking reader, the case that the micro-benchmark and `tt-latency` miss (issue #82).
+- Docs: the release checklist finds the `replay` benchmark binary through Cargo's JSON output: Cargo 1.100 no longer
+  writes bench executables to `target/release/deps/` (found preparing 1.1.0).
+- Docs: the release checklist runs `cargo semver-checks` against the previous stable release; any finding stops the
+  release except the one accepted for 1.1, `repr_align_added` on `Reader` against `v1.0.0` (ADR 0057, note of
+  2026-11-27). Its C ABI step no longer asks for a static program from a `cargo cinstall` package, which links the
+  shared library under `pkg-config --static` on Linux and macOS; the static library is checked through the release
+  archive's `tickertape-static.pc`.
+- Docs: `docs/cli.md` names the library fields behind `age --json`'s `unset_timestamp` and `ahead_of_clock`
+  (`RecordAgeSnapshot::unset` and `ahead`) and behind the `leftovers` of `archive` and `status`.
+- Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
+  after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the crates
+  were published; rerunning the job completed the release). It now asks for up to a minute.
+- Fixed (release tooling): the `verify-cli` job of the v1.0.0 run saw only the previous version of `tickertape-cli` on
+  PyPI for its five minutes of retries, although the upload had succeeded. It now installs without pip's cache and
+  retries for ten minutes.
+
 
 ## [1.0.0] - 2026-11-23
 
@@ -1264,6 +1316,7 @@ First release. Repository tag only; not published to crates.io.
 - Snappy Parquet export with raw unsigned metadata, bounded row groups, and opt-in `--decode market-demo` columns
   (also a `decoded` object in JSONL). Default JSONL output is unchanged by `--decode`.
 
+[1.1.0]: https://github.com/thomas0903/tickertape/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/thomas0903/tickertape/compare/v0.5.1...v1.0.0
 [0.5.1]: https://github.com/thomas0903/tickertape/compare/v0.4.0...v0.5.1
 [0.4.0]: https://github.com/thomas0903/tickertape/compare/v0.3.0...v0.4.0

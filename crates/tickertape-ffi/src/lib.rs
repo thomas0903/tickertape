@@ -63,7 +63,7 @@ pub const TICKERTAPE_ABI_VERSION: u32 = 1;
 pub const TICKERTAPE_VERSION_MAJOR: u32 = 1;
 
 /// The minor version of the library this header belongs to.
-pub const TICKERTAPE_VERSION_MINOR: u32 = 0;
+pub const TICKERTAPE_VERSION_MINOR: u32 = 1;
 
 /// The patch version of the library this header belongs to.
 pub const TICKERTAPE_VERSION_PATCH: u32 = 0;

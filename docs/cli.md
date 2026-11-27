@@ -376,7 +376,8 @@ size; `sealed_unix_ns` is the successor's creation timestamp. `reasons` lists al
 in count, bytes, age order, evaluated after preceding planned removals. `report` is null for a dry run; otherwise
 it counts files and full bytes removed by this run, and planned files already absent at the oldest end due to a
 concurrent archiver. `leftovers` lists the temporary names of interrupted removals
-(`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055) that the run left in the journal directory, basenames; such a
+(`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055) that the run left in the journal directory, basenames (the
+library's `retention::Report::leftovers` has the full paths); such a
 file may hold records the journal no longer has (`operations.md`). A successful empty plan yields an empty `segments` array and zero report counts (or null in
 a dry run). JSON numbers preserve their u64 interpretation; consumers should use field names.
 
@@ -468,8 +469,9 @@ not be established.
   writer refuses such a journal, `exposure` is unknown and `health.corrupt` is true. Other missing segments leave
   `verified` false.
 - `segments.before_checkpoint`: segments older than the checkpoint segment, which retention may remove.
-- `removal_leftovers`: temporary names of segments that an interrupted removal by an archiver left in the journal
-  directory (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055), sorted. Such a file may hold records the journal no
+- `removal_leftovers` (`status::Status::removal_leftovers` in the library, the same names): temporary names of
+  segments that an interrupted removal by an archiver left in the journal directory
+  (`{base:020}.tape.{pid}.{unix_ns}.removing`, ADR 0055), sorted. Such a file may hold records the journal no
   longer has; see `operations.md`. It is not a breach and has no code of its own; the text output lists the names on a
   `leftovers` line.
 - `checkpoint`: the marker's current slot, or null if no slot is valid. `problem` is set when the writer would refuse
@@ -546,6 +548,8 @@ the previous report that was written; null without an interval. `wait` may gain 
   again. (The command starts at the end of the journal, so it returns no record before it is live for the first time,
   and its output has no count of such records; `RecordAge` in the library has one, `before_live`.)
 - `discontinuities` counts discarded or removed histories the command resumed after.
+- Library names: `unset_timestamp` and `ahead_of_clock` are `unset` and `ahead` of `latency::RecordAgeSnapshot`;
+  `after_discontinuity` and `age` have the same names there.
 - `min_ns` and `max_ns` are exact in `age`; in `interval_age` they can be bucket bounds (never above the true minimum,
   never below the true maximum, at most 1/64 off). Percentiles are nearest rank, given as bucket upper bounds: never
   below the true value and at most 1.6 % above it, capped at `max_ns`; with a small `count` the high ones are `max_ns`.
