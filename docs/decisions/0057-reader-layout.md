@@ -194,3 +194,15 @@ x86-64 at the scale of a few per cent; the release checklist's benchmark is what
   x86-64 every layout has about 8 blocked store-to-load forwards per record in the zero-copy reader's path (4 in the
   safe reader's), from values the record path copies through the stack; that is the kind of cost issue #16 removed
   once, and is left for another change.
+
+## Note of 2026-11-27: the alignment is a SemVer finding, accepted for 1.1
+
+`cargo semver-checks check-release --baseline-rev v1.0.0` reports one finding for `tickertape` 1.1.0:
+`repr_align_added` on `Reader`. Raising the alignment from 8 to 16 bytes means that a `#[repr(packed)]` struct can no
+longer contain a `Reader` (a compile error), which Cargo's SemVer rules count as a breaking change. Nothing else of the
+public API changes: no function, signature or field, and no C ABI declaration (the bindings hold their `Reader` behind
+a pointer). Accepted for 1.1 (orchestrator's decision, 2026-11-27): a `Reader` owns files and mappings and is used by
+reference, so packing one into a `#[repr(packed)]` struct has no use we know of, while the fixed layout removes a 15 to
+30 % replay slowdown that hit readers by the accident of their address. The changelog's 1.1.0 behaviour changes and
+`docs/compatibility.md` → Upgrading → 1.0 to 1.1 state it; the release checklist expects exactly this finding when 1.1
+or a later 1.x release is checked against `v1.0.0`.

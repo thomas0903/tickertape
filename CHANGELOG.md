@@ -443,6 +443,13 @@ describes what is released.
   blocking reader, the case that the micro-benchmark and `tt-latency` miss (issue #82).
 - Docs: the release checklist finds the `replay` benchmark binary through Cargo's JSON output: Cargo 1.100 no longer
   writes bench executables to `target/release/deps/` (found preparing 1.1.0).
+- Docs: the release checklist runs `cargo semver-checks` against the previous stable release; any finding stops the
+  release except the one accepted for 1.1, `repr_align_added` on `Reader` against `v1.0.0` (ADR 0057, note of
+  2026-11-27). Its C ABI step no longer asks for a static program from a `cargo cinstall` package, which links the
+  shared library under `pkg-config --static` on Linux and macOS; the static library is checked through the release
+  archive's `tickertape-static.pc`.
+- Docs: `docs/cli.md` names the library fields behind `age --json`'s `unset_timestamp` and `ahead_of_clock`
+  (`RecordAgeSnapshot::unset` and `ahead`) and behind the `leftovers` of `archive` and `status`.
 - Fixed (release tooling): `release.py github-release` asked the release listing for its new draft once, immediately
   after creating it, and the v1.0.0 run failed there because the listing did not show the draft yet (after the crates
   were published; rerunning the job completed the release). It now asks for up to a minute.

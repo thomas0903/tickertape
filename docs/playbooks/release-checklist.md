@@ -183,6 +183,20 @@ single-maintainer repository. Administrators are subject to the checks; force pu
    version (a test fails otherwise); the C++ binding has the release's version (ADR 0036). Dry-running both packages together requires Cargo 1.90+. The release scripts require Python 3.11+; CI
    selects Python 3.12.
 
+   Check the Rust API against the previous stable release with
+   [cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks) (`cargo install cargo-semver-checks
+   --locked`, into a `--root` of its own if you prefer):
+
+   ```sh
+   cargo semver-checks check-release --baseline-rev vX.Y.Z -p tickertape -p tickertape-cli
+   ```
+
+   It must report nothing, with one expected exception: checked against `v1.0.0`, it reports `repr_align_added` on
+   `Reader` (ADR 0057, note of 2026-11-27), which was accepted for 1.1. Any other finding stops the release: an item
+   removed or changed incompatibly needs a new major version, so restore it (or deprecate it instead). List what the
+   release adds to the public API (`cargo public-api`, or a diff of the `pub` items) in its preparation pull request:
+   from that release on it is frozen.
+
 ### Append path against the previous release (minor and major releases)
 
 Issue #82: a change to how a reader checks the marker made appends slower when a durable-only reader blocks, and no
@@ -262,10 +276,14 @@ For the 1.0 release, and checked again for every later release that ships the C 
    - macOS: `otool -D "$STAGE"/usr/local/lib/libtickertape.1.dylib` prints an install name ending in
      `libtickertape.1.dylib` (`@rpath/` or the install prefix, never a build directory).
 4. Link a program against the installed package, not the build tree, and run it: install into a scratch prefix,
-   then build `examples/c/writer.c` and `reader.c` with `pkg-config --cflags --libs tickertape` (and the static
-   variant with `pkg-config --static`), with `PKG_CONFIG_PATH` pointing at the scratch prefix, and run
-   `examples/c/README.md`'s record-and-replay commands. Check that the program loads the installed library (`ldd` on
-   Linux, `otool -L` on macOS).
+   then build `examples/c/writer.c` and `reader.c` with `pkg-config --cflags --libs tickertape`, with
+   `PKG_CONFIG_PATH` pointing at the scratch prefix, and run `examples/c/README.md`'s record-and-replay commands. Check
+   that the program loads the installed library (`ldd` on Linux, `otool -L` on macOS). The static library is checked
+   through the release archive only: `install-test.sh` on an archive built with `release.py c-build` and `c-package`
+   links the examples with the archive's `tickertape-static.pc`, which names `libtickertape.a`, and checks that they
+   load no tickertape library. A `cargo cinstall` package has no such check today: its one `tickertape.pc` gives
+   `-ltickertape` under `pkg-config --static` too, and the linker then takes the shared library, on Linux and macOS
+   alike (found preparing 1.1.0); a static program links `libtickertape.a` by its path.
 4. Merge the release preparation pull request and wait for all CI jobs on the resulting `main` commit to pass.
 5. Confirm the owner has authorized publishing that exact version, then tag that commit:
 
