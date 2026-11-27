@@ -57,7 +57,10 @@ docker run --rm --platform linux/amd64 -v "$HOME:$HOME" -w "$PWD" -e TMPDIR=/wor
 ```
 
 The v0.5.1 and v1.0.0 fixtures were generated on 2026-11-23 with the first two commands (macOS and the OrbStack VM);
-there is no Linux x86-64 set for either.
+there is no Linux x86-64 set for either. The v1.1.0 fixtures were generated on 2026-11-27 the same way (macOS 27.2.1 on
+APFS; the OrbStack VM, Linux 7.2 aarch64 on btrfs; `rustc` 1.99.1 on both), from the tag's own tree and `Cargo.lock`
+(`git archive` of `667c440a`); there is no Linux x86-64 set. Like v1.0.0's, the Linux torn journal has no
+`next-segment.tmp` (the spare segment is off by default on Linux) and the macOS one has.
 
 ## Pack format
 

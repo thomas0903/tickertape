@@ -22,7 +22,9 @@ use support::{Fixture, fixtures};
 
 /// Released tags that must have fixtures. The release checklist adds each new release here together with its
 /// fixtures (`docs/playbooks/release-checklist.md`).
-const RELEASED_TAGS: &[&str] = &["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0", "v0.5.1", "v1.0.0"];
+const RELEASED_TAGS: &[&str] = &[
+    "v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0", "v0.5.1", "v1.0.0", "v1.1.0",
+];
 /// Platforms every released tag must have fixtures from.
 const REQUIRED_PLATFORMS: &[&str] = &["linux-aarch64", "macos-aarch64"];
 

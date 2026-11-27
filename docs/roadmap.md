@@ -112,7 +112,9 @@ comparison, the readers, the scale run, the long verified runs and the confirmin
 [`benchmarks.md`](benchmarks.md):
 an item is ticked only when every criterion holds; each open item says what is still missing. Version 1.0.0 was
 released with seven items open, accepted by the owner as known gaps
-([Released as 1.0.0 with known gaps](#released-as-100-with-known-gaps)).
+([Released as 1.0.0 with known gaps](#released-as-100-with-known-gaps)). Version 1.1.0 was released on 2026-11-27
+(`CHANGELOG.md` → 1.1.0); the lines that its work changed say what is true on that day, and what comes next is
+[After 1.1](#after-11).
 
 ### Next release: sustained performance
 
@@ -147,7 +149,18 @@ released with seven items open, accepted by the owner as known gaps
   - Rerun of the whole comparison at v1.0.0 with the corrected harness (issue #57; JVM warm-up, `microTouch()`, 1 GiB
     `blockSize`, pinning; every tool in one session per machine): `docs/benchmarks.md` → "comparison rerun at v1.0.0"
     (2026-11-25 to 2026-11-26), Linux x86-64 and aarch64, ext4 and xfs, Google Cloud VMs. It supersedes the earlier
-    Linux comparisons and their single-session caveat. Not run: bare metal, unpinned sustained runs.
+    Linux comparisons and their single-session caveat. Not run: bare metal, unpinned sustained runs. Not rerun with
+    1.1.0 (as of 2026-11-27): the published comparison is of v1.0.0, and the README's "Since 1.0.0" list is measured
+    against other baselines ([After 1.1](#after-11), item 3).
+  - Roll and stall work released in 1.1.0 (issue #60; `CHANGELOG.md` → 1.1.0): on Linux, early write-back stops at the
+    128 KiB folio boundary below the writer (ADR 0058, change 1, the default; on aarch64 at 90 % of the device's rate the
+    seconds with an append of 50 ms or more went from 138–151 to 0 on ext4: `docs/benchmarks.md` → "early write-back to
+    the folio boundary"); the prefault helper unmaps and closes finished segments (ADR 0059; the roll's median append
+    without checkpoints 0.83–1.06 ms → 169–179 µs: `docs/benchmarks.md` → "finished segments released off the writer's
+    thread"); and an opt-in spare segment on Linux (ADR 0049, off by default). Still open in #60 (its comment of
+    2026-11-26): ADR 0058's change 2 (proposed), why the aarch64 device queues on that machine shape, the helper-CPU
+    delay, the macOS roll candidates, and the measurements ADR 0049 needs before the spare segment could be Linux's
+    default.
   - macOS, recorded 2026-11-26 on the owner's laptop (Apple M4 Pro, APFS; shared and not idle: `docs/benchmarks.md` →
     "sustained load, roll waits and checkpoint cost on macOS"): tickertape's sustained session with repeated 10-minute
     steady runs at 50 % and 90 % of the probe for both payloads, shorter bursty and visibility-only runs, and a
@@ -198,6 +211,10 @@ released with seven items open, accepted by the owner as known gaps
     the window, so the writer faults it in again (33–36 faults per checkpoint). An idle writer pays once. Syncing the
     active segment by its ranged `msync` alone removed both costs in an experiment; it changes the crash contract's
     barrier step and is not built.
+  - The ranged sync is [ADR 0058](decisions/0058-prefault-residual-faults.md)'s change 2: proposed as of 2026-11-27,
+    not in 1.1.0 (`docs/benchmarks.md` → "Does the ranged sync still flush a volatile write cache?"). Its change 1, the
+    default from 1.1, stops early write-back below the folio the writer fills; a checkpoint may find up to 128 KiB more
+    to write.
   - Missing: a drive with a volatile write cache; background checkpoints with the window (on Linux). The Linux
     results of ADR 0038 and before/after checkpoint and durable-only reader latency are recorded in
     `docs/benchmarks.md` (2026-11-19 to 2026-11-22).
@@ -223,7 +240,10 @@ released with seven items open, accepted by the owner as known gaps
     there and not taken: a smaller read of the safe reader at the tail (measured, mixed result, branch
     `core/safe-reader-tail-reads`), a shared clock read in the spin loop, wakes sent to readers that are registered but
     not asleep, the outlined atomic call on aarch64 (`-C target-feature=+lse`), and durable-only readers that keep their
-    checkpoint descriptor and are woken only by checkpoints.
+    checkpoint descriptor and are woken only by checkpoints. Two of them are in 1.1.0: the safe reader reads 4 KiB at
+    the tail while it waits for every record ([ADR 0052](decisions/0052-safe-reader-tail-reads.md)), and a blocking
+    durable-only reader is woken by checkpoints only ([ADR 0053](decisions/0053-durable-only-readers-wake-on-checkpoints.md));
+    both are measured in `docs/benchmarks.md` (2026-11-26). The profiles were not repeated on 1.1.
 - [ ] **ARM server measurements.**
   - Run correctness/crash checks and the sustained comparison suite on an aarch64 Linux server, targeting
     Google Axion (`c4a` with local SSD), alongside the existing x86-64 and macOS evidence. (Until 2026-11-19 this
@@ -241,7 +261,9 @@ released with seven items open, accepted by the owner as known gaps
     (consistent with reclaim's deferred TLB invalidation), 6 have no such removal near them and are not explained; with
     the journal within RAM there was no reclaim and no event in 1,000 s, too short to confirm. (The appends of 50–128 ms
     in the 1,024 B steady-90 runs on aarch64 ext4 are attributed since 2026-11-25: `docs/benchmarks.md` → "roll and
-    journal stalls".) That view no longer stops a reader (readers tolerate it; `crash-contract.md` → Known risks and
+    journal stalls"; with ADR 0058's change 1, the default from 1.1.0, none remained in the measured cells:
+    `docs/benchmarks.md` → "early write-back to the folio boundary".) That view no longer stops a reader (readers
+    tolerate it; `crash-contract.md` → Known risks and
     limits), and the long verified runs under forced compaction (`3fea1c0`, on aarch64 and x86-64) showed no false
     corruption and no lost write (issue #43, closed). Correctness, crash and soak checks run on aarch64 Linux in CI
     (#12); the sustained sessions and comparison on Axion are recorded in `docs/benchmarks.md` (2026-11-19 to
@@ -291,15 +313,18 @@ released with seven items open, accepted by the owner as known gaps
     discard committed history held in the 21 measured cases, for records still in a segment when the writer opened. Damage
     that recovery cannot tell from a torn append (C11 (3)) is not among them: it is zeroed without a copy under either
     policy.
-  - Still missing: the limits those runs found are not changed (issue #80): every seek reads the whole directory, and so
-    does every checkpoint with retention (once; it no longer opens every segment, and removing a segment no longer reads
-    the directory: ADR 0051). The readers stop silently at a zeroed
-    commit word in older history (issue #79).
-  - Implemented after 1.0 (issue #59, #72): the sparse, rebuildable seek index per sealed segment of
-    [ADR 0045](decisions/0045-sparse-seek-index.md), built by `tickertape index` and used by readers that opt in. Every
-    record from the landing record on is validated; the records before it are not read, which is why it is opt-in. Deferred
-    there: the checkpoint marker as a jump point in the newest segment, a cursor the caller saves, then building from the
-    writer.
+  - What those runs found, as of 1.1.0 (2026-11-27): readers no longer stop silently at a zeroed commit word in older
+    history; they report it (issue #79, closed; ADR 0050). Retention reads only what its policy needs and no longer
+    opens every segment or lists the directory per removed segment (issue #80, closed; ADR 0051). Still missing: every
+    seek, with or without a seek index, and every retention run still list the whole directory once, and a writer's open
+    and a stand-alone `max_bytes` plan still read every file; these costs are stated in `docs/operations.md` → "How many
+    segments to keep", not changed.
+  - Released in 1.1.0 (issue #59, #72): the sparse, rebuildable seek index per sealed segment of
+    [ADR 0045](decisions/0045-sparse-seek-index.md), built by `tickertape index` and used by readers that opt in, with
+    forward seeks from the cursor (ADR 0046) and `Reader::seek_to_end` in every binding. Every record from the landing
+    record on is validated; the records before it are not read, which is why it is opt-in. Measured in
+    `docs/benchmarks.md` → "seeks with and without the seek index". Deferred there (issue #59 stays open for them): the
+    checkpoint marker as a jump point in the newest segment, a cursor the caller saves, then building from the writer.
 
 ### v1.0 readiness
 
@@ -319,10 +344,12 @@ released with seven items open, accepted by the owner as known gaps
     since `fbe5785`. The 1.0.0 fixtures were added after the release, written by the released version. Measured operating limits are published for 64 B and 1,024 B
     ([`benchmarks.md`](benchmarks.md) → Operating envelope and remaining bottlenecks); known issues are in
     [`crash-contract.md`](crash-contract.md) → Known risks and limits.
-  - Since 1.0 (issue #61, [ADR 0047](decisions/0047-latency-histograms.md)): latency histograms in the library, the age
-    of records as a reader returns them, `tickertape age`, and opt-in histograms of the writer's appends, batches, rolls
-    and checkpoints, readable in the writer's process. Open: the bindings, and reading the writer's histograms from
-    another process and in `tickertape status`.
+  - Released in 1.1.0 (issue #61, [ADR 0047](decisions/0047-latency-histograms.md), all three steps built): latency
+    histograms in the library, the age of records as a reader returns them, `tickertape age`, and opt-in histograms of
+    the writer's appends, batches, rolls and checkpoints (`WriterConfig::latency`, off by default), readable in the
+    writer's process. Their cost is in `docs/benchmarks.md` → "what the writer's latency histograms cost". Open (issue
+    #61; deferred by the ADR): the bindings, and reading the writer's histograms from another process and in
+    `tickertape status`.
 
 **v1.0 release gate:** all milestones above are complete under their stated criteria, CI is green on Linux and
 macOS, the aarch64 checks pass, and no known unresolved issue violates the published safety, corruption-detection,
@@ -335,26 +362,32 @@ Version 1.0.0 (2026-11-23) was released on the owner's decision with seven miles
 first condition was waived for them; its other conditions held (CI green on Linux and macOS, the aarch64 checks
 passing, no known unresolved issue violating the published contract). None of the seven changes what 1.0 promises:
 they are measurements, explanations and one design record. They stay open and continue in 1.x, except
-where a line says it is closed:
+where a line says it is closed. Each line says where it stands on 2026-11-27, after 1.1.0 (tracked in issue #62):
 
 - **Sustained-load comparison:** macOS results recorded on 2026-11-26 (tickertape's sustained session; a reduced
   comparison at identical low rates); still missing on macOS: the comparison at each tool's probe rates and 10-minute
-  comparison runs, the lagging and beyond-RAM scenarios (`docs/benchmarks.md`, 2026-11-26, macOS).
+  comparison runs, the lagging and beyond-RAM scenarios (`docs/benchmarks.md`, 2026-11-26, macOS). Nothing new for
+  macOS in 1.1.0; on Linux the comparison is still the one of v1.0.0 ([After 1.1](#after-11), item 3).
 - **eBPF diagnostics:** closed on 2026-11-25; the tracing overhead during the sustained workloads and a conclusion
   confirmed with tracing off are recorded (`docs/benchmarks.md` → "2026-11-25, roll and journal stalls").
 - **Mapped reader:** closed on 2026-11-25. The publication-frontier follow-up had no ADR; it has
-  [0048](decisions/0048-publication-frontier.md) (the marker bound it decides is built). The limitation it narrows is part of
+  [0048](decisions/0048-publication-frontier.md) (the marker bound it decides is built and released in 1.1.0; the shared
+  word stays deferred in 1.x). The limitation it narrows is part of
   the 1.0 contract ([`compatibility.md`](compatibility.md); `crash-contract.md` → Readers, the writer and memory safety).
 - **Cheaper checkpoints:** how much prefaulted, unwritten data adds to a checkpoint is measured on Linux since
   (2026-11-26, [`benchmarks.md`](benchmarks.md)): the 256 KiB window is written as zeros by every checkpoint that
   covers appends, 0.16–0.43 ms of the checkpoint. On macOS (2026-11-26, the same file) the 8 MiB `MADV_WILLNEED` window
   is dirtied as well, and each checkpoint writes the zeros advised since the last one (about 2.5–3.3 ms of a 17 ms
-  checkpoint at 21 MB/s).
+  checkpoint at 21 MB/s). Measured on both platforms; nothing in 1.1.0 removes that cost. The ranged sync that removed
+  it in a Linux experiment is ADR 0058's change 2, proposed and waiting for a drive with a volatile write cache
+  ([above](#next-release-sustained-performance)).
 - **Avoidable work:** the profiles of the readers, notification and serialization paths were not documented; done
   since for v1.0.0 ([above](#next-release-sustained-performance), `docs/benchmarks.md` 2026-11-25); the durable-only
-  reader has not been profiled since #66.
+  reader has not been profiled since #66, nor since 1.1.0 changed how it waits (ADR 0053). Two of the candidates the
+  profiles found are in 1.1.0 (ADR 0052, ADR 0053).
 - **ARM servers:** one of the two latency observations on aarch64 (the 10 ms reader maximum) and the platform mechanism
-  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25). On 2026-11-26 the 10 ms
+  behind issue #43 are not explained; the appends of 50–128 ms are (issue #60, 2026-11-25), and with ADR 0058's change
+  1, the Linux default from 1.1.0, none remained in the measured cells. On 2026-11-26 the 10 ms
   maximum did not reproduce (it belonged to one VM); part of the lagging view is consistent with reclaim removing the
   frame's pages under the readers, the rest is not explained, and neither is confirmed (`docs/benchmarks.md`,
   2026-11-26).
@@ -363,8 +396,57 @@ where a line says it is closed:
   Not measured: archiving under a live writer at this scale, the 128 MiB archive on aarch64, catch-up of a durable-only
   reader, the seek index on a journal being written, xfs (and other filesystems than ext4), and anything with #74 to #77
   (#76 changes the zero-copy reader).
-  The sparse seek index is implemented (ADR 0045, for sealed segments; opt-in) and measured. Not built: building it from
-  the writer, the checkpoint marker as a jump point in the newest segment, a cursor the caller saves.
+  Released in 1.1.0: readers report a zeroed commit word in older history instead of stopping silently (issue #79, ADR
+  0050), retention reads only what its policy needs (issue #80, ADR 0051), and the sparse seek index (ADR 0045, for
+  sealed segments; opt-in), measured. Not changed: the one directory listing per seek and per retention run
+  (`docs/operations.md` → "How many segments to keep"). Not built: building the index from the writer, the checkpoint
+  marker as a jump point in the newest segment, a cursor the caller saves (issue #59).
+
+## After 1.1
+
+The order below is proposed by the maintainers (2026-11-27); the owner has not confirmed it yet.
+
+1. **One bare-metal session.** Every Linux number published since v0.4.0 is from cloud VMs whose local SSDs write at
+   most 351 MB/s; bare metal was left out for now ([owner decisions of 2026-11-19](#path-to-v10); README →
+   Performance → "Standing caveats"; `benchmarks.md` → comparison rerun at v1.0.0 → "What these figures show and do
+   not show"). Closed by a session on a bare-metal machine, recorded in `benchmarks.md`; the 256 B section's "What
+   would be needed to compare on equal terms" names the set-up for its cells.
+2. **Why warm replay is slower than Chronicle Queue's** in three of four pinned ext4 cells of the rerun at v1.0.0
+   (README → Performance → "Where tickertape is ahead, and where it is behind"; `benchmarks.md` → comparison rerun →
+   "Short mode: W1 and W3"). No document records a cause. 1.1.0's release check found 64 B replay level with 1.0.0
+   (`benchmarks.md` → "release 1.1.0 against 1.0.0"), so 1.1 is not expected to change it. Closed by a recorded
+   explanation, or a change measured in those cells.
+3. **A rerun of the comparison with 1.1.** The published comparison is of v1.0.0; the README's "Since 1.0.0" list is
+   measured against other baselines and changes none of its rows (README → Performance → Since 1.0.0). Closed by a
+   rerun at a 1.1 release with the same harness (`benches/rerun.py`), replacing the README's rows.
+4. **Two findings of the 256 B, 100,000 records/s scenario** (`benchmarks.md` → [2026-11-27, Chronicle's published
+   write-to-read example](benchmarks.md#2026-11-27-chronicles-published-write-to-read-example-in-our-harness-256-b-at-100000-recordss-google-cloud-vms)):
+   the zero-copy reader's tail on ext4 from p99.99 up (388–461 µs), probably its pauses at segment rolls but not tied
+   to them by per-record timing; and on tmpfs its 1.65–4.66 ms between p99.7 and p99.999 from the send start, cause
+   not found, also seen with the spare segment on. On Linux the spare segment is off by default, so on tmpfs a roll
+   zeroes the next segment on the writer's thread (maxima 26–32 ms); those runs did not measure `spare_segment(true)`.
+   Closed by per-record timing that settles the rolls, a cause for the tmpfs tail, and the cells rerun with the spare
+   segment (whose default is part of issue #60).
+5. **What the decision records leave open**, by their status lines:
+   [ADR 0058](decisions/0058-prefault-residual-faults.md)'s change 2, the ranged sync of the active segment (proposed; waits for a drive with a volatile write cache);
+   [ADR 0042](decisions/0042-replay-and-recovery-at-scale.md)'s options 3 and 4 (not built; ADR 0051 did the retention
+   part of option 4 another way); [ADR 0047](decisions/0047-latency-histograms.md)'s deferred list (bindings, the
+   writer's histograms from another process, and more); [ADR 0048](decisions/0048-publication-frontier.md)'s shared
+   frontier word (deferred in 1.x). Also [ADR 0052](decisions/0052-safe-reader-tail-reads.md)'s "known gap": one fill
+   counted as following after a reader attaches a wake-up region, with no test of that case.
+6. **Open issues:**
+   - #59: building indexes from the writer, the checkpoint marker as a jump point, a cursor the caller saves (ADR 0045,
+     deferred).
+   - #60: ADR 0058's change 2, the aarch64 device's queueing, the helper-CPU delay, the macOS roll candidates, ADR
+     0049's measurements for a Linux spare-segment default ([above](#next-release-sustained-performance)).
+   - #61: the bindings, and the writer's histograms from another process and in `tickertape status`
+     ([above](#v10-readiness)).
+   - #62: what [Released as 1.0.0 with known gaps](#released-as-100-with-known-gaps) still lists: the macOS
+     comparison, the two aarch64 observations, the cheaper checkpoint.
+   - #86: the M4 Pro's twofold slowdown not re-measured, and 1.9–3.9 % for 40 bytes added at the end of `Reader`
+     (zero-copy, 64 B, x86-64) not explained (ADR 0057).
+   - #93: a way to open at the marker after a refusal; not planned for 1.1 because readers would also need a way to
+     resume past the damaged position (ADR 0056, ADR 0050).
 
 ## Later (explicitly out of scope for v0.1)
 

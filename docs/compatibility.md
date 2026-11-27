@@ -151,7 +151,7 @@ The format is version 1 ([`format.md`](format.md); `format_version` changes when
 misread a file written by new code, `format.md` → Versioning). What "compatible" is tested to mean is ADR 0033: on
 Linux x86-64, Linux aarch64 and macOS, with the fixture shapes the ADR lists,
 
-- **new code reads and continues old journals:** journals written by every released version (v0.1.0 to v0.4.0, v0.5.1 and v1.0.0) are
+- **new code reads and continues old journals:** journals written by every released version (v0.1.0 to v0.4.0, v0.5.1, v1.0.0 and v1.1.0) are
   read identically by the current readers, CLI and Python decoder, and the current writer recovers and continues
   them as the crash contract says (`tests/compat.rs`, `crates/tickertape-cli/tests/compat_fixtures.rs`);
 - **old code reads new journals:** each released version's readers and `verify` read what the current writer wrote,
