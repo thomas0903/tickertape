@@ -78,7 +78,11 @@ describes what is released.
   ext4 (its maxima down from 61–111 ms to 0.6–1.0 ms), 148–180 → 158–366 µs on kernel 6.8. On kernel 6.8, whose ext4 has
   no large folios, no gate figure differed. The first gate set for this default ("no cell worse") was narrowly missed
   and the orchestrator accepted it (ADR 0058 → "Decision for change 1"); a private constant,
-  `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour.
+  `writeback::STOP_AT_FOLIO_BOUNDARY`, restores the old behaviour. The release check of 1.1.0 against 1.0.0 (x86-64,
+  kernel 7.0, 1,024 B at 100,000 records/s with background checkpoints every second, 10 rounds;
+  `docs/benchmarks.md` → "2026-11-27, release 1.1.0 against 1.0.0") shows the same cost at a roll: the roll's append
+  p50 151 → 162 µs and the writer's maximum, a roll in every run, 172 → 183 µs (medians of the rounds; the second copy
+  of 1.0.0 166 µs), while p50, p99 and p99.9 fell. It is attributed by its mechanism, not by a separate run.
 - Changed (Linux): a writer that rolls without checkpoints, or faster than its checkpoints take segments off its hands,
   no longer unmaps and closes the oldest segment it keeps open inside the roll's `append`: the prefault helper
   (`tickertape-prefault`) does it, once it has caught up with prefaulting (ADR 0059, proposed; part of issue #60). At
@@ -368,6 +372,12 @@ describes what is released.
   that the recorded seeks to the last record cross about half a segment. The "Not measured" list of v0.1.0 says what was
   measured later. ADRs 0025 and 0042 have notes.
 - Docs: `docs/operations.md` describes how to move a tape to another machine.
+- Docs: `docs/benchmarks.md` → "2026-11-27, release 1.1.0 against 1.0.0" has the release checklist's two checks
+  against 1.0.0 (x86-64 and aarch64 cloud VMs, 10 interleaved rounds with a second copy of 1.0.0 as the noise floor).
+  Append path: the writer's p50, p99 and p99.9 are lower, the durable-only reader's CPU and context switches fall by two
+  orders of magnitude (ADR 0053), and the writer's maximum, a roll, is higher (ADR 0058, above). Replay: level at
+  1,024 B; at 64 B about 1 % slower on aarch64 for both readers and 0.9 % for the safe reader on x86-64, which is not
+  explained.
 
 ### Benchmarks, tests and tooling
 

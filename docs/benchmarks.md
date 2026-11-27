@@ -6711,6 +6711,98 @@ The Apple M4 Pro where #85 saw the effect (16 KiB pages; not measured, see ADR 0
 held by the bindings; 32-bit targets. Why the hot-fields-first orders and the 40-byte tail padding cost a few per cent on
 x86-64.
 
+## 2026-11-27, release 1.1.0 against 1.0.0: append path and replay (Google Cloud VMs)
+
+The two checks `docs/playbooks/release-checklist.md` asks for before a minor release, run once for 1.1.0. They are
+release gates, not new performance figures: each compares three binaries interleaved on one machine.
+
+**Builds** (the checklist's preferred way). Base: the `v1.0.0` workspace (`1e8651d1`) as it is. Copy: a second copy of
+the base binary (the noise floor). Candidate: the `v1.0.0` workspace with `crates/tickertape` of `main` at `111665f7`
+copied over it (the library of this release; 1.1.0's preparation changes only the crate's README). Each side built in
+its own target directory with `--locked`; the copied crate reports version 1.0.0, so runs are labelled by binary.
+SHA-256 (first 12 hex digits): x86-64 `tt-sustained` base and copy `7fd372c7c449`, candidate `bba9720e7c33`; `replay`
+base and copy `23fb763aad76`, candidate `abf5ac101752`; aarch64 `replay` base and copy `73c0744226d4`, candidate
+`057411a9b11a`.
+
+**Machines.** One quiet VM of each architecture, us-east1-b, Ubuntu 24.04, kernel 7.0.0-1018-gcp, rustc 1.100.0, one
+local NVMe SSD formatted ext4 without lazy initialisation (`/data`): x86-64 `c4-standard-8-lssd` (Intel Xeon 6985P-C, 8
+vCPUs) for both checks, aarch64 `c4a-standard-8-lssd` (Neoverse-V2, 8 vCPUs) for replay. Cloud VMs, not bare metal.
+
+**Order.** 10 rounds of each check, the three builds in rotating order (base, copy, candidate; copy, candidate, base;
+candidate, base, copy), each run a new process.
+
+### Append path (x86-64)
+
+Command, each run with a new `--dir` on the SSD (deleted after the run) and a new `--out`:
+
+```sh
+tt-sustained run --dir /data/tt-<build>-<round> --out <out>/<build>-<round> --json --payload 1024 --duration 15s \
+  --warmup 3s --cpus 1,2,3,4,5,6 --rate 100000 --checkpoint-every 1s --checkpoint-mode background \
+  --retain-bytes 68719476736 --readers mapped,safe:wait=default,safe:durable:wait=block
+```
+
+Every run sent its whole schedule (no unsent records). Paced: latency is measured from each record's intended send
+time (`tt-sustained`'s coordinated-omission handling). Medians of the 10 rounds, with the range; then the median of the
+per-round ratios to the base, with its range and the rounds in which the build was higher than the base.
+
+| Metric | Base (1.0.0) | Copy | Candidate | Copy / base, rounds higher | Candidate / base, rounds higher |
+|---|---|---|---|---|---|
+| Writer `append` p50 | 0.630 µs (0.613–0.647) | 0.625 µs (0.617–0.651) | 0.503 µs (0.471–0.516) | 0.998 (0.968–1.022), 4/10 | 0.797 (0.743–0.816), 0/10 |
+| Writer `append` p99 | 2.54 µs (2.42–3.98) | 2.63 µs (2.41–3.48) | 1.77 µs (1.63–1.92) | 0.993 (0.621–1.387), 4/10 | 0.686 (0.433–0.780), 0/10 |
+| Writer `append` p99.9 | 10.2 µs (6.83–11.6) | 8.28 µs (7.12–11.8) | 2.57 µs (2.42–6.60) | 0.952 (0.619–1.517), 4/10 | 0.261 (0.208–0.884), 0/10 |
+| Writer `append` maximum | 172 µs (158–286) | 166 µs (161–233) | 183 µs (171–197) | 0.957 (0.650–1.224), 4/10 | 1.072 (0.634–1.168), 6/10 |
+| Writer hot thread, system CPU | 0.092 s (0.035–5.62) | 0.042 s (0.036–3.27) | 0.007 s (0.004–0.098) | 0.851 (0.006–93.3), 2/10 | 0.106 (0.001–0.742), 0/10 |
+| Zero-copy reader (spin): CPU, voluntary switches | 1.00; 1,986 | 1.00; 1,988 | 1.00; 1,985 | 1.000; 1.000 | 1.000; 0.999 |
+| Safe reader (default wait): CPU, voluntary switches | 0.987; 2,397 (2,209–2,531) | 0.987; 2,376 | 0.987; 2,095 (2,085–2,098) | 1.000; 1.002 | 1.000; 0.870, 0/10 higher |
+| Durable-only reader (block): CPU | 0.935 (0.932–0.951) | 0.936 (0.933–0.945) | 0.0253 (0.0250–0.0265) | 1.001 (0.992–1.003), 7/10 | 0.027 (0.027–0.028), 0/10 |
+| Durable-only reader (block): voluntary switches | 421,530 (279,122–436,975) | 407,624 (343,293–445,511) | 2,518 (2,513–2,522) | 0.970 (0.899–1.230), 3/10 | 0.006 (0.006–0.009), 0/10 |
+
+- The durable-only reader's CPU and context switches fall by two orders of magnitude, as the checklist expects once
+  (ADR 0053: it is woken by checkpoints, not by every append), and with them the writer's system CPU and its p50 to
+  p99.9.
+- The writer's maximum is the one figure that is higher, by more than the copy differs, in 6 of 10 rounds. In every
+  candidate run it is a roll's `append` (in 6 base and 9 copy runs too), and the roll appends are slower: p50 151 µs
+  (146–167) base, 150 µs (148–159) copy, 162 µs (150–171) candidate; maximum 168, 166 and 183 µs (medians); 14 rolls
+  per run in each build. This is the cost ADR 0058 change 1 recorded at a roll, which now writes back the old
+  segment's last block ("2026-11-26, early write-back to the folio boundary" above, and that change's changelog
+  entry). It is attributed by that mechanism, not by a run that isolates it.
+
+### Replay (x86-64 and aarch64)
+
+Command, with the binary that `cargo bench -p tickertape-bench --bench replay --no-run --message-format=json` reports,
+`CRITERION_HOME` emptied before each run:
+
+```sh
+TMPDIR=/data/tmp <replay binary> --bench 'replay/records/' --warm-up-time 1 --measurement-time 2 --noplot
+```
+
+Criterion's time per iteration (one replay of the fixture: 1,000,000 records of 64 B or 100,000 of 1,024 B, warm, in
+the page cache), the middle estimate. Per case: the base's median, then the median of the per-round ratios to the base
+(above 1 is slower), the range, and the rounds slower than the base.
+
+| Machine | Case | Base median | Copy / base, rounds slower | Candidate / base, rounds slower | Candidate / copy, rounds slower |
+|---|---|---|---|---|---|
+| x86-64 | safe, 64 B | 37.1 ms | 0.996 (0.923–1.048), 3/10 | 1.009 (0.948–1.083), 7/10 | – |
+| x86-64 | safe, 1,024 B | 13.9 ms | 0.962 (0.829–1.092), 4/10 | 0.962 (0.805–1.032), 2/10 | – |
+| x86-64 | mapped, 64 B | 50.7 ms | 1.010 (0.947–1.074), 7/10 | 0.980 (0.927–1.061), 4/10 | – |
+| x86-64 | mapped, 1,024 B | 10.6 ms | 0.986 (0.924–1.050), 3/10 | 1.001 (0.925–1.096), 5/10 | – |
+| aarch64 | safe, 64 B | 38.7 ms | 1.003 (0.974–1.020), 6/10 | 1.009 (0.998–1.024), 9/10 | 1.004 (0.996–1.029), 7/10 |
+| aarch64 | safe, 1,024 B | 15.5 ms | 0.999 (0.993–1.024), 5/10 | 0.995 (0.989–1.009), 4/10 | 0.997 (0.984–1.012), 4/10 |
+| aarch64 | mapped, 64 B | 36.3 ms | 1.008 (0.987–1.026), 8/10 | 1.012 (1.002–1.035), 10/10 | 1.005 (0.997–1.023), 8/10 |
+| aarch64 | mapped, 1,024 B | 10.6 ms | 0.999 (0.995–1.016), 4/10 | 0.993 (0.986–1.003), 3/10 | 0.993 (0.975–1.001), 1/10 |
+
+- No build is slower in a few rounds by 15 % or more and normal in the others (the straddling access of ADR 0057): the
+  largest single-round ratio is 1.096 on x86-64, where the copy reaches 1.092, and 1.035 on aarch64.
+- Not explained: on aarch64 both readers replay 64-byte records about 1 % slower than 1.0.0 (1.009 and 1.012, slower
+  in 9 and 10 of 10 rounds), more than the copy differs (1.003 and 1.008); against the copy, round by round, 0.4–0.5 %
+  (7 and 8 of 10 rounds). That is 0.15–0.45 ns per record. On x86-64 the safe reader's 64-byte case is 0.9 % slower
+  in 7 of 10 rounds against a copy at −0.4 %, within a spread of ±8 % in which the other 64-byte case is 2 % faster. By
+  the checklist's rule these need an explanation before the release; none was measured. The 1,024-byte cases are level
+  or faster on both machines. `reader::tests::reader_layout` passes unchanged.
+
+Raw output (every run's JSON and criterion output, the build logs and the binaries' hashes) is kept with the release
+notes outside the repository.
+
 ## 2026-11-26, sustained load, roll waits and checkpoint cost on macOS (Apple M4 Pro, APFS)
 
 The macOS half of three open items: the sustained session on macOS (roadmap, sustained-load comparison: "Missing: macOS
