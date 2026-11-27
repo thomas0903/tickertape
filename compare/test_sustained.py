@@ -14,7 +14,7 @@ def args(**overrides):
                   workloads=None, payloads=None, rates=None, fractions=None, sync_every_ms=1000, tt_readers=None,
                   resume=False, dry_run=False, keep_going=False, no_long_warmup=False, no_micro_touch=False,
                   chronicle_block_size="1073741824", aeron_sparse_terms=False, no_aeron_pre_touch=False, no_jvm_logs=False,
-                  java_experiment=[])
+                  java_experiment=[], send_start_latency=False)
     values.update(overrides)
     return argparse.Namespace(**values)
 
@@ -22,6 +22,22 @@ def args(**overrides):
 def histogram(count):
     return {"count": count, "min_us": 0.5, "p50_us": 1, "p90_us": 2, "p99_us": 3, "p99_9_us": 4,
             "p99_99_us": 5, "max_us": 6}
+
+
+def with_ladder(stats, scale=1.0):
+    """A histogram with the live reader's percentile ladder; `scale` shifts every value but the maximum."""
+    stats = dict(stats, percentiles_us={key: min(6, (1 + i * 0.4) * scale)
+                                        for i, key in enumerate(sustained.LADDER[:-1])})
+    stats["percentiles_us"]["max"] = stats["max_us"]
+    return stats
+
+
+def send_start_result():
+    result = paced_result()
+    result["send_start_latency"] = True
+    result["reader_result"] = with_ladder(histogram(10_000))
+    result["reader_result"]["from_send_start"] = with_ladder(histogram(10_000), 0.9)
+    return result
 
 
 def paced_result(workload="SV", tool="plain-file"):
@@ -64,6 +80,14 @@ class PlanTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 sustained.parameters(args(**bad))
 
+    def test_payload_of_256_bytes_is_opt_in(self):
+        self.assertEqual(sustained.parameters(args())["payloads"], [64, 1024])
+        params = sustained.parameters(args(payloads="256", rates="100000", workloads="SV", tools="tickertape,chronicle",
+                                           tt_readers="mapped,safe", repeats=1))
+        self.assertEqual([r.label for r in sustained.plan(params)],
+                         ["SV-tickertape-mapped-256-r100000-r1", "SV-tickertape-safe-256-r100000-r1",
+                          "SV-chronicle-default-256-r100000-r1"])
+
     def test_quick_defaults(self):
         params = sustained.parameters(args(quick=True))
         self.assertEqual((params["duration_s"], params["warmup_s"], params["repeats"], params["payloads"]),
@@ -90,6 +114,54 @@ class JavaSettingsTests(unittest.TestCase):
             sustained.prepare_output(out / "m", params, resume=False)
             with self.assertRaises(ValueError):
                 sustained.prepare_output(out / "m", sustained.parameters(args()), resume=True)
+
+
+class SendStartTests(unittest.TestCase):
+    def test_paced_children_get_the_option_and_probes_do_not(self):
+        off = sustained.parameters(args(rates="1000", workloads="probe,SV", tools="tickertape,chronicle"))
+        on = sustained.parameters(args(rates="1000", workloads="probe,SV", tools="tickertape,chronicle",
+                                       send_start_latency=True))
+        self.assertEqual((off["send_start_latency"], on["send_start_latency"]), (False, True))
+        with tempfile.TemporaryDirectory() as tmp:
+            for run in sustained.plan(on):
+                for role in ("writer", "reader"):
+                    with self.subTest(run=run.label, role=role):
+                        cmd = sustained.adapter_command(run, role, "d", "c", 10, 0, 1000, on, Path(tmp))
+                        if run.workload == "probe":
+                            self.assertNotIn("--send-start", cmd)
+                        else:
+                            self.assertEqual(cmd[cmd.index("--send-start") + 1], "on")
+                        self.assertNotIn("--send-start",
+                                         sustained.adapter_command(run, role, "d", "c", 10, 0, 1000, off, Path(tmp)))
+
+    def test_a_matrix_from_before_the_option_resumes_without_it_only(self):
+        params = sustained.parameters(args(rates="1000", workloads="SV", tools="yaque"))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "m"
+            sustained.prepare_output(out, params, resume=False)
+            matrix = json.loads((out / "matrix.json").read_text())
+            del matrix["parameters"]["send_start_latency"]
+            (out / "matrix.json").write_text(json.dumps(matrix))
+            self.assertFalse(sustained.prepare_output(out, params, resume=True))
+            with self.assertRaises(ValueError):
+                sustained.prepare_output(out, dict(params, send_start_latency=True), resume=True)
+
+    def test_validation(self):
+        sustained.validate_sustained(send_start_result())
+        missing = send_start_result()
+        del missing["reader_result"]["from_send_start"]
+        above = send_start_result()
+        above["reader_result"]["from_send_start"]["percentiles_us"]["99.9"] = 5.9
+        fewer = send_start_result()
+        fewer["reader_result"]["from_send_start"]["count"] = 9_999
+        disordered = send_start_result()
+        disordered["reader_result"]["percentiles_us"]["99.97"] = 0.1
+        other_max = send_start_result()
+        other_max["reader_result"]["percentiles_us"]["max"] = 7
+        for name, result in [("missing", missing), ("above", above), ("fewer", fewer), ("disordered", disordered),
+                             ("other maximum", other_max)]:
+            with self.subTest(name), self.assertRaises((AssertionError, KeyError)):
+                sustained.validate_sustained(result)
 
 
 class RateTests(unittest.TestCase):

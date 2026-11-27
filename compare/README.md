@@ -167,10 +167,28 @@ TMPDIR=/mnt/test/tmp python3 compare/run.py ~/compare-sustained --sustained --ke
 
 `TMPDIR` selects the filesystem under test, as in the short mode. `benches/session.py` runs this matrix as part of a
 recorded session. Options: `--duration` (seconds per run, default 600), `--warmup` (paced seconds before the measured
-part, default 10), `--repeats` (default 2), `--tools`, `--workloads`, `--payloads`, `--rates 10000,100000` (explicit
+part, default 10), `--repeats` (default 2), `--tools`, `--workloads`, `--payloads` (64 and 1,024 by default; 256 on
+request), `--rates 10000,100000` (explicit
 rates for every tool) or `--rate-fractions 0.5,0.9` (default), `--sync-every-ms` (default 1000), `--tt-readers
 safe,mapped` (default mapped; `tt-sustained` covers both readers in depth), `--keep-going` (record a failed run in
-`failures.jsonl` and continue; the default stops) and `--dry-run`.
+`failures.jsonl` and continue; the default stops), `--send-start-latency` (below) and `--dry-run`.
+
+**Latency from the send start (`--send-start-latency`, off by default).** In the paced runs (SV, SD) every writer
+also stores its send start in the first 8 application bytes, and the reader records a second histogram from it,
+`reader_result.from_send_start`, beside the usual one from the scheduled send. The send start is the clock read that ends
+the writer's busy-wait, which every writer takes anyway to count late sends (Rust `realtime_ns()`, Java `Instant.now()`,
+the same place in both loops), so the option adds no clock read: the writer does one more 8-byte store into its record
+buffer, and the reader one more 8-byte load from the record and one more histogram record, after the clock read that
+both histograms use. Each record's latency from its send start is its latency from the scheduled send minus the
+writer's delay, so it excludes a late sender's backlog; it still includes the send itself (encoding, the tool's append,
+a roll or chunk change) and the read. The runner rejects a run in which it is above the latency from the scheduled send
+at any percentile. Without the option nothing is stored or read. The unpaced probe stores the send start already.
+
+**Percentile ladder.** The live readers' histograms of the adapters in this directory (SV, SD, and W2 except
+tickertape's, which `tt-latency` measures) also carry `percentiles_us`: 50, 90, 97, 99, 99.7,
+99.9, 99.97, 99.99, 99.997 and 99.999 % and `max`, computed after the run from the same histogram. The 99.999th
+percentile needs at least 100,000 measured records to mean more than the maximum, and several million to be stable:
+60 s at 100,000 records/s is 6,000,000.
 
 **Workloads.** For every tool and payload:
 
@@ -214,10 +232,12 @@ and `results.jsonl` (all `runs/` results concatenated at the end; `runs/` is the
 `r10000` (explicit).
 
 Each result has `writer` (`count`, `planned_count`, `achieved_records_per_s`, `late_records`, `max_late_us`,
-`stopped_by`, `periodic_sync`), `java` (as in the short mode) and `reader_result` (the latency histogram as in W2; for the probe, `count` and
+`stopped_by`, `periodic_sync`), `java` (as in the short mode) and `reader_result` (the latency histogram as in W2, with
+`percentiles_us`, and `from_send_start` with `--send-start-latency`; for the probe, `count` and
 `latency`; `null` for queue-file), plus `tool`, `tool_version`, `guarantees`, `workload`, `payload`, `reader`,
 `concurrent_reader`, `rate_tag`, `rate`, `count`, `warmup`, `duration_s`, `warmup_s`, `sync_every_ms`,
-`periodic_sync_operation`, `repeat`, `quick`, start and finish times, the data directory and free space before the run.
+`periodic_sync_operation`, `send_start_latency`, `repeat`, `quick`, start and finish times, the data directory and free
+space before the run.
 
 **No hidden drops.** The runner rejects a run unless the paced writer sent every scheduled record, the reader received
 exactly the records written (minus the warmup in its histogram), the late count is in range, every percentile is
@@ -364,7 +384,7 @@ reader teardown.
 Java additionally warms the read path in that reader JVM before it opens the fixture for timing (next section);
 this avoids measuring only interpreter startup. Finite warm-ups do not prove that compilation has converged.
 
-`payload` means **application bytes only** (64 or 1,024). Tickertape uses its native
+`payload` means **application bytes only** (64 or 1,024; the sustained mode also takes 256). Tickertape uses its native
 sequence and local timestamp fields. All other tools carry an additional **16 B
 little-endian envelope**: sequence u64 then intended timestamp u64, followed by the
 application bytes. W1/W3 timestamps are zero. Plain file adds a 4 B little-endian

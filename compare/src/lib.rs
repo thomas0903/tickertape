@@ -17,6 +17,48 @@ const SEGMENT_SIZE: u64 = 134_217_728;
 /// Records `append_steady` writes before its timer starts, the same for every tool (Harness.java has the same value).
 const PRIMING_RECORDS: u64 = 1_000;
 
+/// Application payload sizes the adapters accept (Harness.java has the same list). 256 B is for one opt-in scenario
+/// of the sustained mode; the short mode uses 64 and 1,024.
+const PAYLOADS: [usize; 3] = [64, 256, 1024];
+
+/// Percentiles of the live reader's `percentiles_us` (Harness.java has the same list).
+const LADDER: [(&str, f64); 10] = [
+    ("50", 0.5),
+    ("90", 0.9),
+    ("97", 0.97),
+    ("99", 0.99),
+    ("99.7", 0.997),
+    ("99.9", 0.999),
+    ("99.97", 0.9997),
+    ("99.99", 0.9999),
+    ("99.997", 0.99997),
+    ("99.999", 0.99999),
+];
+
+/// The percentile ladder of a latency histogram in µs, with the maximum; `null` values when it is empty.
+fn ladder(hist: &Histogram<u64>) -> Value {
+    let stat = |v: u64| {
+        if hist.is_empty() {
+            Value::Null
+        } else {
+            json!(v as f64 / 1000.0)
+        }
+    };
+    let mut map = serde_json::Map::new();
+    for (name, quantile) in LADDER {
+        map.insert(name.into(), stat(hist.value_at_quantile(quantile)));
+    }
+    map.insert("max".into(), stat(hist.max()));
+    Value::Object(map)
+}
+
+/// The live reader's latency result: the common histogram fields plus `percentiles_us`.
+fn live_histogram(hist: &Histogram<u64>) -> Value {
+    let mut result = histogram_json(hist);
+    result["percentiles_us"] = ladder(hist);
+    result
+}
+
 fn wait_start(control: &Path, role: &str) -> Result<u64> {
     fs::write(control.join(format!("{role}.ready")), [])?;
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -35,6 +77,13 @@ fn validate(data: &[u8], expected: u64, payload: usize) -> Result<u64> {
     }
     std::hint::black_box(&data[16..]);
     Ok(u64::from_le_bytes(data[8..16].try_into()?))
+}
+
+/// The send start that a writer with `--send-start on` stored in the first 8 application bytes.
+fn send_start(application: &[u8]) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        application.get(..8).ok_or("short payload")?.try_into()?,
+    ))
 }
 
 // Only the plain-file adapter uses this decoder. EOF may split either the header
@@ -220,6 +269,7 @@ fn run(tool: &str) -> Result<()> {
             "--sync-every-ms",
             "--cpu",
             "--helper-cpus",
+            "--send-start",
         ],
         &[],
     )?;
@@ -241,9 +291,17 @@ fn run(tool: &str) -> Result<()> {
         ms if live => Some(Duration::from_millis(ms)),
         _ => return Err("--sync-every-ms needs a live mode".into()),
     };
-    if count == 0 || rate == 0 || warmup >= count || ![64, 1024].contains(&payload) {
+    if count == 0 || rate == 0 || warmup >= count || !PAYLOADS.contains(&payload) {
         return Err("invalid count/rate/warmup/payload".into());
     }
+    // --send-start on: the writer also stores the send start (the clock read that ends its busy-wait, which it takes
+    // anyway to count late sends) in the first 8 application bytes, and the reader records a second histogram from it
+    // with the same clock read as the first. Live modes only; off by default.
+    let stamp_send = match opts.optional("--send-start") {
+        None | Some("off") => false,
+        Some("on") if live => true,
+        _ => return Err("--send-start takes on or off and needs a live mode".into()),
+    };
     let control = opts.path("--control");
     let helper_cpus = opts
         .optional("--helper-cpus")
@@ -307,6 +365,7 @@ fn run(tool: &str) -> Result<()> {
         let mut sync_overruns = 0u64;
         let mut next_sync = sync_every.map(|every| Instant::now() + every);
         let mut sent = 0;
+        let mut sent_at = 0;
         let mut stopped_by = "count";
         if probe {
             while clock::realtime_ns() < t0 {
@@ -331,7 +390,8 @@ fn run(tool: &str) -> Result<()> {
                 while clock::realtime_ns() < intended {
                     std::hint::spin_loop();
                 }
-                let delay = clock::realtime_ns() - intended;
+                sent_at = clock::realtime_ns();
+                let delay = sent_at - intended;
                 if delay > 1000 {
                     late += 1;
                 }
@@ -343,6 +403,11 @@ fn run(tool: &str) -> Result<()> {
             start.get_or_insert_with(Instant::now);
             bytes[offset..offset + 8].copy_from_slice(&(priming + i).to_le_bytes());
             bytes[offset + 8..offset + 16].copy_from_slice(&intended.to_le_bytes());
+            if stamp_send {
+                // A probe's timestamp is its send start already.
+                let at = if probe { intended } else { sent_at };
+                bytes[offset + 16..offset + 24].copy_from_slice(&at.to_le_bytes());
+            }
             // Plain file's prefix is passed only to write(2), not other tools.
             sink.send(intended, &bytes)?;
             sent += 1;
@@ -386,6 +451,7 @@ fn run(tool: &str) -> Result<()> {
         return Ok(());
     }
     let mut hist = Histogram::<u64>::new(3)?;
+    let mut from_send = Histogram::<u64>::new(3)?;
     let start = Instant::now(); // Includes fresh reader opening for W3.
     // A probe's count is only a disk cap: its deadline follows the duration instead.
     let deadline = start
@@ -402,16 +468,20 @@ fn run(tool: &str) -> Result<()> {
         known: !probe,
         control: control.clone(),
     };
-    let mut observe = |seq: u64, ts: u64, len: usize| -> Result<()> {
-        if seq != expected || len != payload {
+    // `application` is the record's application payload; only --send-start reads it.
+    let mut observe = |seq: u64, ts: u64, application: &[u8]| -> Result<()> {
+        if seq != expected || application.len() != payload {
             return Err("record sequence or length mismatch".into());
         }
         if live && expected >= warmup {
-            hist.record(
-                clock::realtime_ns()
-                    .checked_sub(ts)
-                    .ok_or("wall clock moved backwards")?,
-            )?;
+            let now = clock::realtime_ns();
+            hist.record(now.checked_sub(ts).ok_or("wall clock moved backwards")?)?;
+            if stamp_send {
+                from_send.record(
+                    now.checked_sub(send_start(application)?)
+                        .ok_or("wall clock moved backwards")?,
+                )?;
+            }
         }
         expected += 1;
         Ok(())
@@ -446,7 +516,7 @@ fn run(tool: &str) -> Result<()> {
             while received < target.count {
                 if let Some(record) = r.try_next()? {
                     std::hint::black_box(record.payload);
-                    observe(record.seq, record.local_ts_ns, record.payload.len())?;
+                    observe(record.seq, record.local_ts_ns, record.payload)?;
                     received += 1;
                 } else {
                     idle(&mut target)?;
@@ -463,11 +533,7 @@ fn run(tool: &str) -> Result<()> {
             ready()?;
             while received < target.count {
                 if let Some(bytes) = r.poll()? {
-                    observe(
-                        received,
-                        validate(bytes, received, payload)?,
-                        bytes.len() - 16,
-                    )?;
+                    observe(received, validate(bytes, received, payload)?, &bytes[16..])?;
                     received += 1;
                 } else {
                     idle(&mut target)?;
@@ -487,7 +553,7 @@ fn run(tool: &str) -> Result<()> {
                         observe(
                             received,
                             validate(&record, received, payload)?,
-                            record.len() - 16,
+                            &record[16..],
                         )?;
                         record.commit()?;
                         received += 1;
@@ -506,7 +572,7 @@ fn run(tool: &str) -> Result<()> {
                 observe(
                     i as u64,
                     validate(&record, i as u64, payload)?,
-                    record.len() - 16,
+                    &record[16..],
                 )?;
                 received += 1;
             }
@@ -520,7 +586,7 @@ fn run(tool: &str) -> Result<()> {
             let mut iter = r.iter();
             for i in 0..count {
                 let bytes = iter.borrowed_next().ok_or("truncated queue")?;
-                observe(i, validate(bytes, i, payload)?, bytes.len() - 16)?;
+                observe(i, validate(bytes, i, payload)?, &bytes[16..])?;
                 received += 1;
             }
             (start.elapsed().as_secs_f64(), read_back()?)
@@ -534,7 +600,11 @@ fn run(tool: &str) -> Result<()> {
     let mut result = if probe {
         json!({"count": read, "latency_from": "send start", "latency": histogram_json(&hist)})
     } else if live {
-        histogram_json(&hist)
+        let mut result = live_histogram(&hist);
+        if stamp_send {
+            result["from_send_start"] = live_histogram(&from_send);
+        }
+        result
     } else {
         json!({"count": count, "seconds": seconds,
         "records_per_s": count as f64 / seconds, "payload_mb_per_s": count as f64 * payload as f64 / seconds / 1e6})
@@ -590,6 +660,37 @@ mod tests {
         assert!(reader.poll().unwrap().is_none());
         writer.write_all(&frame).unwrap();
         assert!(reader.poll().unwrap().is_some());
+    }
+
+    #[test]
+    fn ladder_has_every_percentile_in_order_and_the_maximum() {
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        for v in 1..=100_000u64 {
+            hist.record(v).unwrap();
+        }
+        let stats = live_histogram(&hist);
+        let ladder = stats["percentiles_us"].as_object().unwrap();
+        let names: Vec<_> = ladder.keys().cloned().collect();
+        let mut expected: Vec<String> = LADDER.iter().map(|(n, _)| n.to_string()).collect();
+        expected.push("max".into());
+        assert_eq!(names, expected);
+        let values: Vec<f64> = ladder.values().map(|v| v.as_f64().unwrap()).collect();
+        assert!(values.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(ladder["50"], stats["p50_us"]);
+        assert_eq!(ladder["99.99"], stats["p99_99_us"]);
+        assert_eq!(ladder["max"], stats["max_us"]);
+        // 3 significant digits: 99,999 ns is in the bucket of 99.9 µs.
+        assert!((ladder["99.999"].as_f64().unwrap() - 100.0).abs() < 0.2);
+        let empty = live_histogram(&Histogram::<u64>::new(3).unwrap());
+        assert!(empty["percentiles_us"]["99.9"].is_null());
+    }
+
+    #[test]
+    fn send_start_is_the_first_eight_application_bytes() {
+        let mut application = vec![0x5a; 256];
+        application[..8].copy_from_slice(&1_234_567_u64.to_le_bytes());
+        assert_eq!(send_start(&application).unwrap(), 1_234_567);
+        assert!(send_start(&application[..7]).is_err());
     }
 
     #[test]

@@ -19,11 +19,13 @@ public final class Main {
         final UnsafeBuffer buffer=new UnsafeBuffer(ByteBuffer.allocateDirect(1040));
         // One handler for all polls: a capturing lambda per poll is garbage whenever HotSpot does not inline poll().
         Harness.Observer observer;
+        final boolean sendStart=Harness.sendStartRequested();
         final FragmentHandler handler=(data,offset,length,header)-> {
             if (length<16) throw new IllegalStateException("short message");
             data.getByte(offset+length-1);
             observer.record(data.getLong(offset,ByteOrder.LITTLE_ENDIAN),
-                data.getLong(offset+8,ByteOrder.LITTLE_ENDIAN),length-16);
+                data.getLong(offset+8,ByteOrder.LITTLE_ENDIAN),
+                sendStart ? data.getLong(offset+16,ByteOrder.LITTLE_ENDIAN) : 0,length-16);
         };
         IpcEndpoint(String role, Path dir) {
             String directory=dir.resolve("driver").toString();

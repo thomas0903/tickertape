@@ -17,6 +17,7 @@ public final class Main {
         /** The open-source appender's substitute for the Enterprise pretoucher; null when switched off. */
         final MicroTouched microTouch;
         final long blockSize;
+        final boolean sendStart=Harness.sendStartRequested();
         long attempts; // Calls that reached a new page; the touch is only made if that page is mapped.
         QueueEndpoint(String role, Path dir) {
             // Periodic durability (SD) uses msync(MS_SYNC) through SyncMode.SYNC; otherwise the default.
@@ -43,9 +44,11 @@ public final class Main {
                 Bytes<?> b=dc.wire().bytes();
                 int length=(int)b.readRemaining();
                 long seq=b.readLong(), ts=b.readLong();
+                // --send-start: the first 8 application bytes, read in place.
+                long sent=sendStart ? b.readLong(b.readPosition()) : 0;
                 // Touch the last payload byte without copying the mapped document.
                 b.readByte(b.readPosition()+length-17);
-                observer.record(seq,ts,length-16);
+                observer.record(seq,ts,sent,length-16);
                 return true;
             }
         }

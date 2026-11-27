@@ -11,7 +11,9 @@ import java.util.*;
 /** Shared roles and schedule. Receive implementations call Observer after validating
  * framing; no payload copy is required by the common measurement interface. */
 public final class Harness {
-    public interface Observer { void record(long seq, long intended, int payload); }
+    /** sendStart is the send start a writer with --send-start on stored in the first 8 application bytes; endpoints
+     * pass 0 without it (sendStartRequested()). */
+    public interface Observer { void record(long seq, long intended, long sendStart, int payload); }
     public interface Endpoint extends AutoCloseable {
         default void send(byte[] bytes) throws Exception { throw new UnsupportedOperationException(); }
         default boolean poll(Observer observer) throws Exception { throw new UnsupportedOperationException(); }
@@ -39,6 +41,14 @@ public final class Harness {
     public static volatile boolean periodicSyncRequested = false;
     /** The run's options, set before endpoints open. */
     public static volatile Map<String,String> options = Map.of();
+    /** Application payload sizes the adapters accept (compare/src/lib.rs has the same list). */
+    static final Set<Integer> PAYLOADS = Set.of(64, 256, 1024);
+    /** Percentiles of the live reader's percentiles_us (compare/src/lib.rs has the same list). */
+    static final double[] LADDER = {50, 90, 97, 99, 99.7, 99.9, 99.97, 99.99, 99.997, 99.999};
+    static final String[] LADDER_NAMES = {"50","90","97","99","99.7","99.9","99.97","99.99","99.997","99.999"};
+    /** --send-start on: the writer stores its send start in the first 8 application bytes and the reader records a
+     * second histogram from it. Endpoints read it into a final field when they open. */
+    public static boolean sendStartRequested() { return options.getOrDefault("--send-start","off").equals("on"); }
     static volatile boolean live = false;
     public enum Phase { MEASURED, FULL_WARMUP, FRESH_WARMUP }
     /** What endpoints are opened for now; the long warm-up opens scratch endpoints of its own. */
@@ -75,6 +85,15 @@ public final class Harness {
         String[] names = {"p50_us","p90_us","p99_us","p99_9_us","p99_99_us"};
         for (int i=0;i<qs.length;i++) r.put(names[i],h.getValueAtPercentile(qs[i])/1000.0);
         r.put("max_us", h.getMaxValue()/1000.0);
+        return r;
+    }
+    /** The live reader's latency result: the common fields plus the percentile ladder with the maximum. */
+    static Map<String,Object> liveHistogram(Histogram h) {
+        Map<String,Object> r = histogram(h);
+        Map<String,Object> ladder = new LinkedHashMap<>();
+        for (int i=0;i<LADDER.length;i++) ladder.put(LADDER_NAMES[i],h.getValueAtPercentile(LADDER[i])/1000.0);
+        ladder.put("max",h.getMaxValue()/1000.0);
+        r.put("percentiles_us",ladder);
         return r;
     }
     /** Records a batch of the send or poll loop: small enough that the loops are compiled as ordinary methods in
@@ -116,7 +135,7 @@ public final class Harness {
     /** The writer's loop. The long warm-up runs the same object code on scratch endpoints. */
     static final class Sender {
         final Endpoint endpoint; final byte[] data; final ByteBuffer buffer;
-        final boolean live, probe; final long rate, durationNs, syncEveryNs;
+        final boolean live, probe, stampSend=sendStartRequested(); final long rate, durationNs, syncEveryNs;
         final Histogram syncHist=new Histogram(3);
         final Episodes episodes=episodes();
         long t0, seqBase, start, sent, late, maxLate, nextSync, syncOverruns;
@@ -130,20 +149,23 @@ public final class Harness {
         /** Sends records from..to; false once a probe's duration has passed. */
         boolean send(long from, long to) throws Exception {
             for (long i=from;i<to;i++) {
-                long intended;
+                long intended, sentAt=0;
                 if (probe) {
                     // An unpaced probe stores the actual send start, so reader latency is from the send.
                     intended=now();
+                    sentAt=intended;
                     if (i>0 && System.nanoTime()-start>=durationNs) { stoppedBy="duration"; return false; }
                 } else if (live) {
                     intended=Math.addExact(t0, Math.multiplyExact(i,1_000_000_000L)/rate);
                     while (now()<intended) { endpoint.idle(); Thread.onSpinWait(); }
                     long wall=now(), delay=wall-intended;
+                    sentAt=wall;
                     if (delay>LATE_NS) { late++; if (episodes!=null) episodes.over(i,wall,delay); }
                     else if (episodes!=null) episodes.open=false;
                     maxLate=Math.max(maxLate,delay);
                 } else intended=0;
                 buffer.putLong(0,seqBase+i); buffer.putLong(8,intended);
+                if (stampSend) buffer.putLong(16,sentAt);
                 endpoint.send(data);
                 sent++;
                 if (syncEveryNs>0) {
@@ -164,17 +186,24 @@ public final class Harness {
     /** The reader's per-record check and histogram. */
     static final class Receiver implements Observer {
         final int payload; final boolean live; final long warmup; final Histogram hist;
+        /** From the send start (--send-start on), else null. */
+        final Histogram fromSend;
         final Episodes episodes=episodes();
         long expected;
         Receiver(int payload, boolean live, long warmup, Histogram hist) {
             this.payload=payload; this.live=live; this.warmup=warmup; this.hist=hist;
+            fromSend=live && sendStartRequested() ? new Histogram(3) : null;
         }
-        public void record(long seq, long ts, int len) {
+        public void record(long seq, long ts, long sendStart, int len) {
             if (seq!=expected || len!=payload) throw new IllegalStateException("record sequence/length mismatch");
             if (live && expected>=warmup) {
                 long wall=now(), latency=wall-ts;
                 if (latency<0) throw new IllegalStateException("wall clock moved backwards");
                 hist.recordValue(latency);
+                if (fromSend!=null) {
+                    if (wall<sendStart) throw new IllegalStateException("wall clock moved backwards");
+                    fromSend.recordValue(wall-sendStart);
+                }
                 if (episodes!=null) { if (latency>SLOW_NS) episodes.over(seq,wall,latency); else episodes.open=false; }
             }
             expected++;
@@ -251,7 +280,7 @@ public final class Harness {
         Map<String,String> opts = new HashMap<>();
         Set<String> allowed = Set.of("--dir","--control","--count","--payload","--rate","--warmup","--reader","--mode","--jit-warmup",
             "--duration-ms","--sync-every-ms","--cpu",
-            "--warmup-mode","--events","--micro-touch","--block-size","--sparse-terms","--pre-touch");
+            "--warmup-mode","--events","--micro-touch","--block-size","--sparse-terms","--pre-touch","--send-start");
         for (int i=1;i<args.length;i+=2) {
             if (!allowed.contains(args[i]) || i+1>=args.length || opts.put(args[i],args[i+1])!=null)
                 throw new IllegalArgumentException("bad option " + args[i]);
@@ -267,8 +296,10 @@ public final class Harness {
         live = opts.get("--mode").equals("visible_latency") || probe;
         long durationNs = Long.parseLong(opts.getOrDefault("--duration-ms","0"))*1_000_000L;
         long syncEveryNs = Long.parseLong(opts.getOrDefault("--sync-every-ms","0"))*1_000_000L;
-        if (count<=0 || rate<=0 || warmup<0 || warmup>=count || (payload!=64 && payload!=1024)
-            || probe != (durationNs>0) || syncEveryNs<0 || (syncEveryNs>0 && !live))
+        String sendStart=opts.getOrDefault("--send-start","off");
+        if (count<=0 || rate<=0 || warmup<0 || warmup>=count || !PAYLOADS.contains(payload)
+            || probe != (durationNs>0) || syncEveryNs<0 || (syncEveryNs>0 && !live)
+            || !(sendStart.equals("off") || (sendStart.equals("on") && live)))
             throw new IllegalArgumentException("invalid benchmark options");
         periodicSyncRequested = syncEveryNs>0;
         options = Map.copyOf(opts);
@@ -305,7 +336,7 @@ public final class Harness {
             } else {
                 try (Endpoint warm=factory.open("reader",dir)) {
                     long[] read={0};
-                    Observer observer=(seq,ts,len)->read[0]++;
+                    Observer observer=(seq,ts,sent,len)->read[0]++;
                     long deadline=System.nanoTime()+TIMEOUT;
                     while (read[0]<Math.min(jitWarmup,count)) {
                         warm.poll(observer);
@@ -400,7 +431,10 @@ public final class Harness {
                     Map<String,Object> m=new LinkedHashMap<>();
                     m.put("count",target); m.put("latency_from","send start"); m.put("latency",histogram(hist));
                     result=m;
-                } else result=live?histogram(hist):new LinkedHashMap<>(Map.of("count",count,"seconds",seconds,
+                } else if (live) {
+                    result=liveHistogram(hist);
+                    if (receiver.fromSend!=null) result.put("from_send_start",liveHistogram(receiver.fromSend));
+                } else result=new LinkedHashMap<>(Map.of("count",count,"seconds",seconds,
                     "records_per_s",count/seconds,"payload_mb_per_s",count*payload/seconds/1e6));
                 result.put("affinity",Affinity.report(opts.get("--cpu"),control,role));
                 result.put("java",javaBlock(warmupInfo,endpoint,receiver.episodes));
