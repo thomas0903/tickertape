@@ -265,7 +265,7 @@ fresh reader process from open to the last record. Higher is better.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="charts/rerun-throughput-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="charts/rerun-throughput-light.svg">
-  <img alt="Dot chart of W1 append and W3 warm replay throughput at v1.0.0 in million records/s, axis from zero, each of the n = 4 runs per cell a point, x86-64 and aarch64, 64 B and 1,024 B, ext4, pinned. W1 append: tickertape ahead of Chronicle Queue at 64 B on both machines and at 1,024 B on aarch64; at 1,024 B on x86-64 their ranges overlap. W3 replay: Chronicle Queue ahead of both tickertape readers on x86-64 at both sizes and on aarch64 at 1,024 B; at 64 B on aarch64 the ranges of Chronicle Queue and both tickertape readers overlap; yaque ahead of the zero-copy reader at 64 B on x86-64 and of the safe reader at 1,024 B on x86-64." src="charts/rerun-throughput-light.svg">
+  <img alt="W1 append and W3 warm replay throughput at v1.0.0, ext4, pinned (the README's comparison cells), million records/s from zero, each of 4 runs a point. W1: tickertape ahead of Chronicle Queue at 64 B on both machines and at 1,024 B on aarch64; their ranges overlap at 1,024 B on x86-64. W3: Chronicle Queue ahead of both tickertape readers on x86-64 and at 1,024 B on aarch64, overlapping at 64 B on aarch64; yaque ahead of a tickertape reader in two x86-64 cells." src="charts/rerun-throughput-light.svg">
 </picture>
 
 **W1-cold**
@@ -382,7 +382,7 @@ included). µs unless marked; min–max of the runs. Lower is better. queue-file
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="charts/rerun-w2-p999-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="charts/rerun-w2-p999-light.svg">
-  <img alt="Dot chart of reader p99.9 latency at v1.0.0 on a logarithmic axis: eight cells (x86-64 and aarch64, 64 B and 1,024 B, 10,000 and 100,000 records/s) by five tools, each of the n = 4 runs a point. At 10,000 records/s Chronicle Queue is the lowest in three cells and in three of four runs in the fourth (x86-64, 1,024 B), whose fourth run is 15.75 ms. At 100,000 records/s Aeron IPC has the lowest observed p99.9 in all four cells; at 64 B tickertape's zero-copy reader is below Chronicle Queue on both machines; at 1,024 B Chronicle Queue and the plain file are below both tickertape readers." src="charts/rerun-w2-p999-light.svg">
+  <img alt="Reader p99.9 at v1.0.0, ext4, pinned (the README's comparison cells), logarithmic axis from 0.2 to 100 µs, each of 4 runs a point. At 10,000 records/s Chronicle Queue is the lowest in three cells and in three of four runs in the fourth, whose fourth run, 15.75 ms, is marked beyond the axis; Aeron IPC is below tickertape's zero-copy reader at 1,024 B. At 100,000 records/s Aeron IPC has the lowest observed p99.9 in all four cells; tickertape's zero-copy reader is below Chronicle Queue at 64 B; Chronicle Queue and the plain file are below both tickertape readers at 1,024 B." src="charts/rerun-w2-p999-light.svg">
 </picture>
 
 **64 B at 10,000 records/s**
@@ -549,13 +549,7 @@ marked. **The target rates differ per tool and round:** read every SV and SD fig
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="charts/rerun-probe-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="charts/rerun-probe-light.svg">
-  <img alt="Dot chart of the ten-minute unpaced probe at v1.0.0 in million records/s, axis from zero, one point per round (two rounds). Aeron IPC, which writes no durable journal, is the highest in every cell but one round on aarch64 at 64 B, where tickertape was higher. At 64 B tickertape is above Chronicle Queue on both machines; at 1,024 B the two journals are close to the disk's limit and Chronicle Queue is slightly above tickertape in every pair." src="charts/rerun-probe-light.svg">
-</picture>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="charts/rerun-paced-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="charts/rerun-paced-light.svg">
-  <img alt="Dot chart on logarithmic axes of the ten-minute paced runs at v1.0.0, each tool at half of its own unpaced rate, so not the same load; each tool's target rate is printed beside its marks; one point per round, filled for p99.9 or median and hollow for maximum. SV reader p99.9: tickertape 323–697 µs, Chronicle Queue 89.98–102.69 ms, Aeron IPC 14.72–107.41 ms. SD sync median, not the same operation: tickertape checkpoint 1.38–2.99 ms, Chronicle Queue synchronous store flush 302.78–516.16 ms. SD reader p99.9: tickertape 837 µs to 2.39 ms, Chronicle Queue 302.78–621.28 ms." src="charts/rerun-paced-light.svg">
+  <img alt="Ten-minute unpaced probe at v1.0.0, ext4, pinned (the README's comparison cells), million records/s from zero, one point per round. Aeron IPC, not a durable journal, is the highest except in one aarch64 round at 64 B. At 64 B tickertape is above Chronicle Queue on both machines; at 1,024 B both journals are at about the SSD's limit and Chronicle Queue is 1.1–1.6 % above tickertape in every round." src="charts/rerun-probe-light.svg">
 </picture>
 
 **Probe, 64 B (unpaced; records/s and reader latency from the send)**
@@ -647,6 +641,12 @@ marked. **The target rates differ per tool and round:** read every SV and SD fig
 | aarch64 | xfs | sustained-journals | pinned | Chronicle Queue | 1 | unpaced | 340,696 | 0.69 | 4.33 | 13.1 | 20.14 ms |
 | aarch64 | xfs | sustained-90 | pinned | tickertape | 1 | unpaced | 338,426 | 0.92 | 2.88 | 11.3 | 117.05 ms |
 | aarch64 | xfs | sustained-90 | pinned | Chronicle Queue | 1 | unpaced | 341,594 | 0.73 | 4.56 | 14.5 | 21.02 ms |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="charts/rerun-paced-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="charts/rerun-paced-light.svg">
+  <img alt="Ten-minute paced runs at v1.0.0, pinned, ext4 and xfs, each tool at half of its own unpaced rate, so not the same load; each target rate is printed. SV reader p99.9: on ext4 tickertape's is below the other tools' in every cell; on xfs Chronicle Queue's is lower than tickertape's in three of four cells. SD on ext4: a tickertape checkpoint and Chronicle Queue's store flush, which do not do the same work." src="charts/rerun-paced-light.svg">
+</picture>
 
 **SV, 64 B (paced at 50 % of the probe, no sync)**
 
@@ -1485,7 +1485,7 @@ deviation, the floor a difference has to clear.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="charts/since-adr0059-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="charts/since-adr0059-light.svg">
-  <img alt="Before and after chart of releasing finished segments off the writer's thread (ADR 0059), Linux x86-64, 60-second runs, min–max of 6 runs per build. Gain: the roll's median append falls from 877–1,060 µs to 47–176 µs without checkpoints and is unchanged with checkpoints every second. Cost: all appends' p99.99 at 64 B without the spare segment rises from 6.0–6.6 to 6.6–7.0 µs; in the other cells the ranges overlap." src="charts/since-adr0059-light.svg">
+  <img alt="Segments released off the writer's thread (ADR 0059), before and after, Linux x86-64, 60-second runs, min–max of 6 runs. Without checkpoints the roll's median append falls from 0.88–1.06 ms to 47–176 µs; with checkpoints it is unchanged. Cost: all appends' p99.99 at 64 B without the spare segment about 0.5 µs higher in all 6 pairs." src="charts/since-adr0059-light.svg">
 </picture>
 
 | Cell (payload, checkpoints, spare) | Writer-thread faults per run: base → change | Median ratio, pairs higher / lower | Append p99.99 (µs): base → change | Median ratio, pairs higher / lower | Base/base: median, largest | Roll append p50 (µs): base → change |
@@ -2657,7 +2657,7 @@ tt-sustained-<build> run … --unpaced --payload 1024 --duration 60s --readers m
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="charts/since-adr0058-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="charts/since-adr0058-light.svg">
-  <img alt="Before and after chart of early write-back to the folio boundary (ADR 0058), main after 1.0.0, 10-minute runs, n = 2 per build. Gains: on aarch64 at 90 % of the device's rate the seconds with an append of 50 ms or more go from 138–151 to 0 on ext4 and 2–4 to 0 on xfs, background checkpoints are durable after about 1 ms instead of 352–406 ms, and the device writes 1.002–1.005 instead of 1.059–1.084 times the appended bytes. Costs: the roll's median append rises (188–189 to 260–266 µs on aarch64 ext4; 148–180 to 158–366 µs on kernel 6.8), and at 64 B on aarch64 checkpoint to durable rises from 912–914 to 946–952 µs and the zero-copy reader's p99.9 from 312–316 to 325–335 µs; on x86-64 at 1,024 B the checkpoint's p99 rises from 4.08–4.87 to 5.06–5.98 ms." src="charts/since-adr0058-light.svg">
+  <img alt="Early write-back to the folio boundary (ADR 0058), before and after, on main after 1.0.0, 10-minute runs, n = 2 per build. On kernel 7.0: no appends of 50 ms or more at 90 % of the rate on aarch64 (138–151 seconds before on ext4), 5–8 % fewer device bytes, background checkpoints durable after about 1 ms instead of 352–406 ms. Costs: slower roll appends in five of seven cells, slightly later checkpoints and a higher reader p99.9 at 64 B, a higher checkpoint p99 on x86-64. On kernel 6.8: no gain." src="charts/since-adr0058-light.svg">
 </picture>
 
 | Machine | Cell | Build | n | Records/s | Late sends (%) | p50 | p99 | p99.9 | p99.99 | max | Seconds ≥ 50 ms | Seconds ≥ 10 ms | Device / appended |
@@ -2863,7 +2863,7 @@ cold runs' bytes read, readahead included.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="charts/since-seek-index-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="charts/since-seek-index-light.svg">
-  <img alt="Chart on logarithmic axes of seeks with and without the seek index, main after 1.0.0, x86-64 and aarch64, both readers, 64 B and 1,024 B, median with min–max. Without the index a seek in a sealed 128 MiB segment takes longer the further the target is (warm up to 11.6–56.7 ms, cold 191–192 ms to the last record); with it every median is 78–112 µs warm and 0.46–0.81 ms cold. Cost: building the indexes of 1 GiB takes 152–483 ms warm and 1.57 s cold, and with the index the records before the landing place are not read." src="charts/since-seek-index-light.svg">
+  <img alt="Seeks in a sealed 128 MiB segment with and without the seek index (added after 1.0.0, off by default), x86-64 and aarch64, median and range on a logarithmic axis. With the index every median is 78–112 µs warm and 0.46–0.81 ms cold; without it 0.26–56.7 ms warm and 1.25–192 ms cold, growing with the target's place. Cost: building the indexes of 1 GiB takes 152–483 ms warm and 1.57 s cold, and the records before the landing place are not read." src="charts/since-seek-index-light.svg">
 </picture>
 
 | Machine | Payload | Reader | Target | warm, without index | warm, with index | cold, without index | cold, with index | read from storage, cold, KiB (without / with) |

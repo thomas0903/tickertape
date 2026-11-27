@@ -9,7 +9,9 @@ who has the raw results:
 
 Each raw directory is the one that holds `results/rerun/rerun.json`. Only units that `rerun.json` marks done are read
 (the failed sustained units are read for the cells that completed), as for the published tables. Only the cells of the
-README's tables are exported: ext4, `pinned`. Values are the raw floats of the result files, not rounded.
+README's tables are exported (ext4, `pinned`), and for the
+ten-minute chart of docs/benchmarks.md also the SV runs on xfs (`sustained-journals`) and the plain file's SV runs on ext4
+(`sustained-others`). Values are the raw floats of the result files, not rounded.
 """
 import glob
 import json
@@ -83,22 +85,29 @@ def main(x86_dir, arm_dir):
                     workload="W2", metric="reader p99.9", machine=machine, payload=r["payload"], rate=r["rate"],
                     tool=tool, reader=reader, unit="µs")
         for m, r in sustained:
-            if m["fs"] != "ext4" or m["config"] != "pinned" or m["part"] != "sustained":
+            # ext4 pinned, both rounds (the README's table); on xfs (part sustained-journals, one round) the SV runs of
+            # the two journals; the plain file's SV runs on ext4 (part sustained-others, one round, run separately).
+            wanted = ((m["fs"], m["part"]) == ("ext4", "sustained")
+                      or ((m["fs"], m["part"]) == ("xfs", "sustained-journals") and r["workload"] == "SV")
+                      or ((m["fs"], m["part"], m["tool"]) == ("ext4", "sustained-others", "plain-file")
+                          and r["workload"] == "SV"))
+            if m["config"] != "pinned" or not wanted:
                 continue
             tool = TOOL[m["tool"]]
-            base = dict(chart="ten-minute", machine=machine, payload=r["payload"], tool=tool,
-                        reader="zero-copy" if m["tool"] == "tickertape" else None)
+            base = dict(chart="ten-minute", machine=machine, fs=m["fs"], part=m["part"], payload=r["payload"],
+                        tool=tool, reader="zero-copy" if m["tool"] == "tickertape" else None)
+            key = (m["fs"], m["part"], machine, r["payload"], tool)
             run = {"round": m["round"]}
             w, rr = r["writer"], r["reader_result"]
             if r["workload"] == "probe":
-                add(("probe", machine, r["payload"], tool), dict(run, records_per_s=w["achieved_records_per_s"]),
+                add(("probe",) + key, dict(run, records_per_s=w["achieved_records_per_s"]),
                     workload="probe", unit="records/s", **base)
             elif r["workload"] == "SV":
-                add(("SV", machine, r["payload"], tool), dict(run, target_records_per_s=r["rate"],
+                add(("SV",) + key, dict(run, target_records_per_s=r["rate"],
                     reader_p99_9_us=rr["p99_9_us"], reader_max_us=rr["max_us"]), workload="SV", unit="µs", **base)
             elif r["workload"] == "SD":
                 s = w["periodic_sync"]["latency"]
-                add(("SD", machine, r["payload"], tool), dict(run, target_records_per_s=r["rate"],
+                add(("SD",) + key, dict(run, target_records_per_s=r["rate"],
                     sync_p50_us=s["p50_us"], sync_max_us=s["max_us"], reader_p99_9_us=rr["p99_9_us"]),
                     workload="SD", unit="µs", sync_operation={"tickertape": "Writer::checkpoint (blocking)",
                     "Chronicle Queue": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)"}[tool], **base)
@@ -109,15 +118,15 @@ def main(x86_dir, arm_dir):
         cell["n"] = len(cell["runs"])
         out.append(cell)
     order = {"throughput": 0, "w2": 1, "ten-minute": 2}
-    out.sort(key=lambda c: (order[c["chart"]], c.get("workload", ""), c["machine"], c["payload"], c.get("rate") or 0,
-                            c["tool"], c.get("reader") or ""))
+    out.sort(key=lambda c: (order[c["chart"]], c.get("workload", ""), c.get("fs", ""), c.get("part", ""), c["machine"],
+                            c["payload"], c.get("rate") or 0, c["tool"], c.get("reader") or ""))
     doc = {
-        "about": "Values plotted by the comparison charts: the README tables of the rerun at v1.0.0 (ext4, pinned).",
+        "about": "Values plotted by the comparison charts: the README tables of the rerun at v1.0.0 (ext4, pinned), plus "
+                 "the SV runs on xfs and the plain file's SV runs on ext4 for the paced chart of docs/benchmarks.md.",
         "source": "raw result files of the rerun (not in the repository), exported by docs/charts/export_rerun.py",
         "section": "docs/benchmarks.md#" + SECTION,
         "session_commit": commits,
         "library": "v1.0.0",
-        "filesystem": "ext4",
         "config": "pinned",
         "machines": {"x86-64": "Google Cloud c4-standard-16-lssd (Xeon 6985P-C)",
                      "aarch64": "Google Cloud c4a-standard-8-lssd (Neoverse-V2)"},

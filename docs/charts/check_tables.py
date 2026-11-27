@@ -6,9 +6,10 @@
 For every cell of the comparison charts (`data/rerun-v1.0.0.json`) it rounds the smallest and the largest run as the
 tables do (half up; three significant digits, two decimals for million records/s and for milliseconds, whole records/s)
 and compares the result with the cell of the README's table and with the matching row of `docs/benchmarks.md`
-(ext4, pinned). For the since-1.0.0 charts (`data/since-1.0.0.json`), whose values were taken from the published tables,
-it checks that each cell's `table_text` occurs in the section of `docs/benchmarks.md` named by the cell. It prints
-every mismatch and exits 1 if there is one.
+(ext4, pinned); each ten-minute cell (also the xfs and plain-file SV runs, which only docs/benchmarks.md has) is compared
+with its rows of the sustained tables there. For the since-1.0.0 charts (`data/since-1.0.0.json`), whose values were
+typed from the published tables, it finds the row and column each cell names and compares the numbers and the text. It
+prints every mismatch and exits 1 if there is one. It does not replace looking at the rendered charts.
 """
 import json
 import os
@@ -155,7 +156,8 @@ def main():
     # README: ten-minute table
     def tm(workload, tool, machine, payload):
         c = [c for c in cells if c["chart"] == "ten-minute" and c["workload"] == workload and c["tool"] == tool
-             and c["machine"] == machine and c["payload"] == payload]
+             and c["machine"] == machine and c["payload"] == payload and c["fs"] == "ext4"
+             and c["part"] == "sustained"]
         assert len(c) == 1 and [r["round"] for r in c[0]["runs"]] == [1, 2]
         return c[0]["runs"]
     whole = lambda v: f"{half_up(v, 0):,.0f}"
@@ -224,9 +226,38 @@ def main():
                 if c:
                     compare(f"benchmarks.md W2 {payload} B {rate}/s {tool} {reader or ''} {machine}", text,
                             us_range(c[0]["runs"]))
+    # docs/benchmarks.md: every ten-minute cell against its rows of the sustained tables (one row per run and round)
+    def us_cell(v):  # the sustained tables: µs without a unit below 1 ms, then "ms", then "s"
+        if v >= 999995:
+            return f"{half_up(v / 1e6, 2):,.2f} s"
+        n, u = us_text(v)
+        return n if u == "µs" else f"{n} ms"
+    sustained_cols = {
+        "probe": [("Achieved (records/s)", lambda r: whole(r["records_per_s"]))],
+        "SV": [("Target (records/s)", lambda r: whole(r["target_records_per_s"])),
+               ("p99.9", lambda r: us_cell(r["reader_p99_9_us"])), ("max", lambda r: us_cell(r["reader_max_us"]))],
+        "SD": [("Target (records/s)", lambda r: whole(r["target_records_per_s"])),
+               ("p99.9", lambda r: us_cell(r["reader_p99_9_us"])), ("Sync p50", lambda r: us_cell(r["sync_p50_us"])),
+               ("Sync max", lambda r: us_cell(r["sync_max_us"]))],
+    }
+    titles = {("probe", 64): "**Probe, 64 B", ("probe", 1024): "**Probe, 1,024 B**", ("SV", 64): "**SV, 64 B",
+              ("SV", 1024): "**SV, 1,024 B**", ("SD", 64): "**SD, 64 B", ("SD", 1024): "**SD, 1,024 B**"}
+    for c in cells:
+        if c["chart"] != "ten-minute":
+            continue
+        part_text = section(rerun, titles[(c["workload"], c["payload"])], "\n\n**")
+        for r in c["runs"]:
+            prefix = f"| {c['machine']} | {c['fs']} | {c['part']} | pinned | {c['tool']} | {r['round']} |"
+            for column, f in sustained_cols[c["workload"]]:
+                text = find_cell(part_text, prefix, column)
+                compare(f"benchmarks.md {c['workload']} {prefix} {column}", text, f(r))
+
     # since-1.0.0: each cell's values against the table row and column it names
     since_path = os.path.join(HERE, "data", "since-1.0.0.json")
     since = json.load(open(since_path, encoding="utf-8"))
+    ids = [c["id"] for c in since["cells"]]
+    if len(ids) != len(set(ids)):
+        errors.append("since-1.0.0: duplicate cell ids")
     for c in since["cells"]:
         checked += 1
         sub = section(section(bench, c["section_heading"]), c["subsection"], "\n### ")

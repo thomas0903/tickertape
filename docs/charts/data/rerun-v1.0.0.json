@@ -1,5 +1,5 @@
 {
- "about": "Values plotted by the comparison charts: the README tables of the rerun at v1.0.0 (ext4, pinned).",
+ "about": "Values plotted by the comparison charts: the README tables of the rerun at v1.0.0 (ext4, pinned), plus the SV runs on xfs and the plain file's SV runs on ext4 for the paced chart of docs/benchmarks.md.",
  "source": "raw result files of the rerun (not in the repository), exported by docs/charts/export_rerun.py",
  "section": "docs/benchmarks.md#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64",
  "session_commit": {
@@ -7,7 +7,6 @@
   "aarch64": "fb2d91b0d0531ba4628779479c7c5e5b04edda62"
  },
  "library": "v1.0.0",
- "filesystem": "ext4",
  "config": "pinned",
  "machines": {
   "x86-64": "Google Cloud c4-standard-16-lssd (Xeon 6985P-C)",
@@ -1252,6 +1251,8 @@
    "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1279,6 +1280,8 @@
    "sync_operation": "Writer::checkpoint (blocking)",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1306,6 +1309,8 @@
    "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1333,6 +1338,8 @@
    "sync_operation": "Writer::checkpoint (blocking)",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1360,6 +1367,8 @@
    "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1387,6 +1396,8 @@
    "sync_operation": "Writer::checkpoint (blocking)",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1414,6 +1425,8 @@
    "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1441,6 +1454,8 @@
    "sync_operation": "Writer::checkpoint (blocking)",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1467,6 +1482,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1491,6 +1508,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1515,6 +1534,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1539,6 +1560,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1563,6 +1586,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1587,6 +1612,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1611,6 +1638,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1635,6 +1664,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1659,6 +1690,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1683,6 +1716,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1707,6 +1742,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1731,6 +1768,8 @@
    "unit": "µs",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1751,10 +1790,252 @@
    "n": 2
   },
   {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained-others",
+   "payload": 64,
+   "tool": "plain file",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 566898,
+     "reader_p99_9_us": 18317.311,
+     "reader_max_us": 139591.679
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained-others",
+   "payload": 1024,
+   "tool": "plain file",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 171198,
+     "reader_p99_9_us": 87425.023,
+     "reader_max_us": 138543.103
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained-others",
+   "payload": 64,
+   "tool": "plain file",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 858252,
+     "reader_p99_9_us": 16687.103,
+     "reader_max_us": 122093.567
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained-others",
+   "payload": 1024,
+   "tool": "plain file",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 174390,
+     "reader_p99_9_us": 96927.743,
+     "reader_max_us": 140115.967
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1386373,
+     "reader_p99_9_us": 10.551,
+     "reader_max_us": 4841.471
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1732727,
+     "reader_p99_9_us": 381.695,
+     "reader_max_us": 1187.839
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 170348,
+     "reader_p99_9_us": 11.111,
+     "reader_max_us": 6340.607
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 169277,
+     "reader_p99_9_us": 200.575,
+     "reader_max_us": 1395.711
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1758803,
+     "reader_p99_9_us": 33308.671,
+     "reader_max_us": 38043.647
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1759845,
+     "reader_p99_9_us": 431.871,
+     "reader_max_us": 2469.887
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 175464,
+     "reader_p99_9_us": 25.087,
+     "reader_max_us": 5406.719
+    }
+   ],
+   "n": 1
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "fs": "xfs",
+   "part": "sustained-journals",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 173262,
+     "reader_p99_9_us": 283.647,
+     "reader_max_us": 1784.831
+    }
+   ],
+   "n": 1
+  },
+  {
    "workload": "probe",
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1775,6 +2056,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1795,6 +2078,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1815,6 +2100,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1835,6 +2122,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1855,6 +2144,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "aarch64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1875,6 +2166,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1895,6 +2188,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1915,6 +2210,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 64,
    "tool": "tickertape",
    "reader": "zero-copy",
@@ -1935,6 +2232,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Aeron IPC",
    "reader": null,
@@ -1955,6 +2254,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "Chronicle Queue",
    "reader": null,
@@ -1975,6 +2276,8 @@
    "unit": "records/s",
    "chart": "ten-minute",
    "machine": "x86-64",
+   "fs": "ext4",
+   "part": "sustained",
    "payload": 1024,
    "tool": "tickertape",
    "reader": "zero-copy",
