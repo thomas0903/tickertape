@@ -383,8 +383,13 @@ describes what is released.
   1.0.0 (x86-64 and aarch64 cloud VMs, 10 interleaved rounds with a second copy of 1.0.0 as the noise floor). Append
   path: the writer's p50, p99 and p99.9 are lower, the durable-only reader's CPU and context switches fall by two orders
   of magnitude (ADR 0053), and the writer's maximum, a roll, is higher (consistent with ADR 0058, above). Replay: level
-  at 1,024 B; at 64 B about 1 % slower on aarch64 for both readers and 0.9 % for the safe reader on x86-64, which is not
-  explained.
+  at 1,024 B; at 64 B the gate measured both readers about 1 % slower than 1.0.0 on aarch64 (1.009 and 1.012, slower in
+  9 and 10 of 10 rounds; the copy 1.003 and 1.008) and the safe reader 2.8 % slower than the copy on x86-64 (8 of 10
+  rounds). A second session per architecture, the same byte-identical binaries and the record path's nine intermediate
+  states, 16 rounds each, did not reproduce it: `main` against 1.0.0 is 1.002 (zero-copy) and 1.0005 (safe) on aarch64
+  (copy 1.003 and 0.9995) and 0.972 and 0.999 on x86-64 (copy 0.990 and 1.001), and the states move by up to 1.5 %
+  (aarch64) and 5 % (x86-64) from one to the next in both directions with no step that stays to `main`. So no change on
+  the record path is a measured replay cost of 1.1; the gate's figures came with its session.
 
 ### Benchmarks, tests and tooling
 

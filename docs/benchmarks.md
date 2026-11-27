@@ -6837,12 +6837,118 @@ the page cache), the middle estimate. Per case: the base's median, then the medi
 
 - No build is slower in a few rounds by 15 % or more and normal in the others (the straddling access of ADR 0057): the
   largest single-round ratio is 1.096 on x86-64, where the copy reaches 1.092, and 1.035 on aarch64.
-- Not explained: on aarch64 both readers replay 64-byte records about 1 % slower than 1.0.0 (1.009 and 1.012, slower
-  in 9 and 10 of 10 rounds), more than the copy differs (1.003 and 1.008); against the copy, round by round, 0.4–0.5 %
-  (7 and 8 of 10 rounds). That is 0.15–0.45 ns per record. On x86-64 the safe reader's 64-byte case is 0.9 % slower
-  in 7 of 10 rounds against a copy at −0.4 %, within a spread of ±8 % in which the other 64-byte case is 2 % faster. By
-  the checklist's rule these need an explanation before the release; none was measured. The 1,024-byte cases are level
-  or faster on both machines. `reader::tests::reader_layout` passes unchanged.
+- The 64-byte cases are slower than 1.0.0 by more than the copy in this gate: on aarch64 both readers (1.009 and
+  1.012, slower in 9 and 10 of 10 rounds, against copies at 1.003 and 1.008; against the copy round by round 1.004 and
+  1.005, 7 and 8 of 10 rounds; 0.15–0.45 ns per record), and on x86-64 the safe reader, whose ratio to the copy is the
+  largest of all, 1.028 (0.993–1.088, slower in 8 of 10 rounds), while the zero-copy reader there is faster (0.976). By
+  the checklist's rule they needed an explanation: the next subsection shows that the same binaries are level with
+  1.0.0 on two other VMs of the same types, so they are not the code's. The 1,024-byte cases are level or faster on
+  both machines. `reader::tests::reader_layout` passes unchanged.
+
+### Isolating the 64-byte replay difference (aarch64 and x86-64, the same day)
+
+The gate above left the 64-byte replay cases slower than 1.0.0 by more than the copy, on aarch64 for both readers and on
+x86-64 for the safe reader (1.028 against the copy, 8 of 10 rounds). One session per architecture bisected the changes
+to the readers' record path between 1.0.0 and `main`: the same base, copy and candidate as the gate, and between them
+`crates/tickertape` at the end of each pull request that touched the readers, each in the v1.0.0 workspace (all build
+there), one workspace and target directory per build, 16 rounds in rotating order (each round starts one build later),
+each run a new process, the two 64-byte cases only (`--bench 'replay/records/(safe|mapped)/64$'`, otherwise the gate's
+command). Same machine types, zone and kernel as the gate, new VMs: `tt-rel11-arm2` (`c4a-standard-8-lssd`, 01:15 to
+01:45 UTC) and `tt-rel11-x86d` (`c4-standard-8-lssd`, 01:50 to 02:21 UTC). The states:
+
+- `s66`: `crates/tickertape` at `eba5fa12`, after #66 (forward seeks, `seek_to_end`)
+- `s74`: `crates/tickertape` at `dfef8cd9`, after #72 and #74 (seek index, ADR 0045)
+- `s76`: `crates/tickertape` at `e08c364e`, after #76 (ADR 0048, the bound)
+- `s85`: `crates/tickertape` at `8912012a`, after #85 (ADR 0050, empty slots)
+- `s91`: `crates/tickertape` at `76781eab`, after #90 and #91 (ADR 0056, ADR 0053)
+- `s94`: `crates/tickertape` at `164d34fb`, after #94 (ADR 0047, writer histograms)
+- `s96`: `crates/tickertape` at `42b2307e`, after #96 (ADR 0052, tail reads)
+- `s103`: `crates/tickertape` at `5eb6109d`, after #100 and #103 (ADR 0056 amendment, ADR 0057 layout)
+- `main`: `crates/tickertape` at `111665f7`, after #104 to #117 (`main`)
+
+The base and `main` binaries are byte for byte those of the gate (SHA-256 `73c0744226d4` and `057411a9b11a` on aarch64,
+`23fb763aad76` and `abf5ac101752` on x86-64): the builds are reproducible, so these sessions measure exactly what the
+gate measured. Per state: ns per record (the median time per iteration over 1,000,000 records), then the median of the
+per-round ratios to the base, its range and the rounds slower, the same against the copy, and against the state before
+it.
+
+aarch64, zero-copy reader, 64 B:
+
+| Build | ns per record (median) | / base: median (range), rounds slower | / copy: median, rounds slower | / previous state: median, rounds slower |
+|---|---|---|---|---|
+| base | 36.61 | 1.0000 (1.0000–1.0000), 0/16 | 0.9967, 7/16 | – |
+| base2 | 36.61 | 1.0033 (0.9835–1.1414), 9/16 | 1.0000, 0/16 | – |
+| s66 | 36.34 | 0.9980 (0.9865–1.1227), 7/16 | 0.9973, 7/16 | 0.9980, 7/16 |
+| s74 | 36.66 | 1.0139 (0.9915–1.1287), 12/16 | 1.0044, 11/16 | 1.0075, 13/16 |
+| s76 | 36.92 | 1.0098 (0.9957–1.0719), 13/16 | 1.0037, 9/16 | 0.9980, 7/16 |
+| s85 | 36.48 | 1.0000 (0.9756–1.0177), 8/16 | 0.9909, 5/16 | 0.9892, 2/16 |
+| s91 | 36.16 | 0.9934 (0.9738–1.0182), 6/16 | 0.9903, 3/16 | 0.9962, 5/16 |
+| s94 | 36.21 | 0.9944 (0.9779–1.0151), 3/16 | 0.9884, 4/16 | 1.0013, 9/16 |
+| s96 | 36.67 | 1.0076 (0.9878–1.0893), 11/16 | 1.0056, 10/16 | 1.0135, 15/16 |
+| s103 | 36.92 | 1.0148 (0.9904–1.0383), 12/16 | 1.0094, 12/16 | 1.0022, 9/16 |
+| main | 36.68 | 1.0019 (0.9857–1.0344), 10/16 | 1.0034, 10/16 | 0.9893, 5/16 |
+
+aarch64, safe reader, 64 B:
+
+| Build | ns per record (median) | / base: median (range), rounds slower | / copy: median, rounds slower | / previous state: median, rounds slower |
+|---|---|---|---|---|
+| base | 38.76 | 1.0000 (1.0000–1.0000), 0/16 | 1.0005, 8/16 | – |
+| base2 | 38.66 | 0.9995 (0.9778–1.1818), 8/16 | 1.0000, 0/16 | – |
+| s66 | 38.58 | 0.9983 (0.9849–1.0934), 7/16 | 0.9998, 7/16 | 0.9983, 7/16 |
+| s74 | 38.65 | 0.9991 (0.9818–1.1753), 7/16 | 1.0028, 10/16 | 1.0002, 8/16 |
+| s76 | 38.64 | 0.9992 (0.9858–1.0831), 7/16 | 0.9962, 6/16 | 0.9988, 6/16 |
+| s85 | 38.80 | 1.0041 (0.9839–1.0164), 9/16 | 1.0005, 8/16 | 1.0011, 8/16 |
+| s91 | 38.73 | 1.0017 (0.9835–1.0089), 8/16 | 1.0019, 9/16 | 0.9943, 5/16 |
+| s94 | 38.78 | 1.0000 (0.9858–1.0118), 8/16 | 1.0011, 8/16 | 0.9972, 7/16 |
+| s96 | 38.65 | 1.0000 (0.9799–1.0121), 8/16 | 0.9971, 5/16 | 0.9994, 8/16 |
+| s103 | 39.09 | 1.0077 (0.9893–1.0236), 13/16 | 1.0050, 11/16 | 1.0049, 13/16 |
+| main | 38.77 | 1.0005 (0.9781–1.0206), 8/16 | 1.0003, 9/16 | 0.9911, 5/16 |
+
+x86-64, zero-copy reader, 64 B:
+
+| Build | ns per record (median) | / base: median (range), rounds slower | / copy: median, rounds slower | / previous state: median, rounds slower |
+|---|---|---|---|---|
+| base | 49.48 | 1.0000 (1.0000–1.0000), 0/16 | 1.0100, 12/16 | – |
+| base2 | 48.58 | 0.9901 (0.8620–1.2631), 4/16 | 1.0000, 0/16 | – |
+| s66 | 50.70 | 1.0023 (0.8949–1.4780), 8/16 | 1.0230, 11/16 | 1.0023, 8/16 |
+| s74 | 50.84 | 1.0086 (0.8105–1.6153), 9/16 | 1.0080, 10/16 | 0.9999, 8/16 |
+| s76 | 49.01 | 0.9582 (0.7801–1.2627), 4/16 | 0.9775, 4/16 | 0.9656, 3/16 |
+| s85 | 48.52 | 0.9715 (0.8032–1.2488), 6/16 | 0.9758, 4/16 | 0.9977, 7/16 |
+| s91 | 48.17 | 0.9832 (0.7032–1.2904), 6/16 | 0.9852, 6/16 | 1.0014, 8/16 |
+| s94 | 43.16 | 0.9628 (0.7073–1.3110), 4/16 | 0.9951, 7/16 | 0.9993, 8/16 |
+| s96 | 49.99 | 1.0265 (0.7168–1.3058), 9/16 | 1.0437, 13/16 | 1.0500, 14/16 |
+| s103 | 43.12 | 0.9545 (0.7270–1.3018), 4/16 | 0.9720, 5/16 | 0.9468, 3/16 |
+| main | 48.21 | 0.9717 (0.7044–1.2903), 6/16 | 0.9990, 8/16 | 1.0171, 10/16 |
+
+x86-64, safe reader, 64 B:
+
+| Build | ns per record (median) | / base: median (range), rounds slower | / copy: median, rounds slower | / previous state: median, rounds slower |
+|---|---|---|---|---|
+| base | 34.58 | 1.0000 (1.0000–1.0000), 0/16 | 0.9994, 7/16 | – |
+| base2 | 35.68 | 1.0006 (0.9078–1.1560), 9/16 | 1.0000, 0/16 | – |
+| s66 | 36.16 | 1.0012 (0.9050–1.2461), 9/16 | 0.9940, 6/16 | 1.0012, 9/16 |
+| s74 | 36.41 | 0.9877 (0.8866–1.5262), 7/16 | 0.9849, 3/16 | 0.9918, 5/16 |
+| s76 | 36.17 | 0.9948 (0.8850–1.1889), 7/16 | 0.9944, 6/16 | 1.0025, 9/16 |
+| s85 | 35.94 | 0.9857 (0.8620–1.1400), 6/16 | 0.9828, 4/16 | 0.9896, 5/16 |
+| s91 | 34.81 | 0.9835 (0.9322–1.1202), 5/16 | 0.9902, 6/16 | 0.9952, 7/16 |
+| s94 | 35.27 | 1.0010 (0.9228–1.2091), 8/16 | 0.9936, 6/16 | 0.9910, 7/16 |
+| s96 | 37.23 | 1.0381 (0.9224–1.2937), 12/16 | 1.0249, 12/16 | 1.0274, 10/16 |
+| s103 | 34.18 | 0.9905 (0.9005–1.1605), 5/16 | 0.9884, 4/16 | 0.9510, 4/16 |
+| main | 34.54 | 0.9986 (0.8207–1.1469), 7/16 | 0.9907, 7/16 | 1.0119, 10/16 |
+
+**What this shows.** In these sessions `main` is not slower than 1.0.0 by more than the copy: aarch64 1.0019 (10 of 16
+rounds) for the zero-copy reader and 1.0005 (8/16) for the safe reader, against copies at 1.0033 and 0.9995 (0.07 and
+0.01 ns per record); x86-64 0.9717 (6/16) and 0.9986 (7/16), against 0.9901 and 1.0006. The same binaries that the gate
+measured at 1.012 and 1.009 on aarch64, and at 1.028 against the copy for the x86-64 safe reader, are level with 1.0.0
+here, so the gate's 64-byte differences came with that session (its VMs or its runs), not with the code. Between the
+states, the 64-byte cases move by up to about 1.5 % on aarch64 and 5 % on x86-64 from one state to the next, in both
+directions (aarch64 zero-copy: up at #72/#74 and at #96, down at #85 and at the last step; x86-64: up at #96, down at
+#103), and no step stays: each is undone within a state or two, as code placement does. None of the changes on the
+record path can be named as a cost: the session cannot attribute a slowdown because there is none that survives to
+`main`. On x86-64 the per-round range is wide (0.70 to 1.6; the copy's 0.86 to 1.26), so its table is the weaker
+evidence; aarch64's ranges are 2 to 4 % apart from a few rounds. ADR 0048's bar for its bound (+0.5 ns per record for
+the zero-copy reader at 64 B) is not needed for the explanation: the state right after it (#76) is 0.998 of the state
+before it on aarch64 (7 of 16 rounds slower) and 0.966 on x86-64.
 
 Raw output (every run's JSON and criterion output, the build logs and the binaries' hashes) is kept with the release
 notes outside the repository.
