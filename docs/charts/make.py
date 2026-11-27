@@ -233,7 +233,7 @@ def draw_row(ax, t, y, row, data, xlim):
         yy = y + s.get("dy", 0.0)
         hollow = s.get("hollow", False)
         face, edge = (t["bg"], c) if hollow else (c, t["bg"])
-        mark = dict(marker=mk, linestyle="none", markersize=5.8, markerfacecolor=face, markeredgecolor=edge,
+        mark = dict(marker=mk, linestyle="none", markersize=s.get("size", 5.8), markerfacecolor=face, markeredgecolor=edge,
                     markeredgewidth=1.3 if hollow else 0.9, zorder=4, clip_on=False)
         if s.get("range"):
             lo, hi = s["range"]
@@ -440,14 +440,16 @@ def probe(rerun):
 
 def paced(rerun):
     cells = rerun["cells"]
-    xlim, ticks = (5, 2e6), [10, 100, 1000, 10000, 100000, 1000000]
+    xlim, ticks = (2, 2e6), [10, 100, 1000, 10000, 100000, 1000000]
 
     def targets(c):
         return "; ".join(f"{r['target_records_per_s']:,}" for r in c["runs"])
 
     def series(c, value, maxkey):
         n = len(c["runs"])
-        return dict(series=[dict(runs=[r[value] for r in c["runs"]], no_line=True, dy=-0.2, span=0.14 if n > 1 else 0),
+        # the filled p99.9 (or median) mark is drawn larger than the hollow maximum: it is the figure the table leads with
+        return dict(series=[dict(runs=[r[value] for r in c["runs"]], no_line=True, dy=-0.2, span=0.14 if n > 1 else 0,
+                                 size=7.4),
                             dict(runs=[r[maxkey] for r in c["runs"]], hollow=True, no_line=True, dy=0.2,
                                  span=0.14 if n > 1 else 0)])
 
@@ -456,11 +458,11 @@ def paced(rerun):
         for p in (64, 1024):
             for tool, fs, part, label in (
                     ("tickertape", "ext4", "sustained", "tickertape, ext4"),
-                    ("tickertape", "xfs", "sustained-journals", "tickertape, xfs"),
+                    ("tickertape", "xfs", "sustained-journals", "tickertape, xfs, 1 run"),
                     ("Chronicle Queue", "ext4", "sustained", "Chronicle Queue, ext4"),
-                    ("Chronicle Queue", "xfs", "sustained-journals", "Chronicle Queue, xfs"),
+                    ("Chronicle Queue", "xfs", "sustained-journals", "Chronicle Queue, xfs, 1 run"),
                     ("Aeron IPC", "ext4", "sustained", "Aeron IPC, ext4"),
-                    ("plain file", "ext4", "sustained-others", "plain file, ext4 *")):
+                    ("plain file", "ext4", "sustained-others", "plain file, ext4, 1 run *")):
                 c = cell(cells, chart="ten-minute", workload="SV", machine=m, payload=p, tool=tool, fs=fs, part=part)
                 sv_rows.append(dict(group=f"{m}, {p:,} B", label=label, key=tool, annot=targets(c)))
                 sv_data.append(series(c, "reader_p99_9_us", "reader_max_us"))
@@ -479,9 +481,9 @@ def paced(rerun):
     return dict(
         title="Ten-minute paced runs, pinned, v1.0.0",
         subtitle=[("Each tool at half of its own unpaced rate; not the same load.", True),
-                  ("SV on ext4 and xfs, SD on ext4. Each mark's target rate is printed beside it. ext4: one run per "
-                   "round (two rounds); xfs and the plain file (*, run separately, later): one run. Lower is better.",
-                   False)],
+                  ("SV on ext4 and xfs, SD on ext4. Each mark's target rate is printed beside it. Rows without a mark: "
+                   "one run per round, two rounds. \"1 run\": a single run, on xfs in its own part of the session, "
+                   "and for the plain file (*) in a separate part, later. Lower is better.", False)],
         panels=[
             dict(title="SV, no syncs: reader p99.9 (filled, upper) and max (hollow, lower)", rows=sv_rows,
                  columns=[dict(data=sv_data)], **common),
@@ -491,7 +493,7 @@ def paced(rerun):
                         "durable 0.93 s after its request (later tickertape-only runs at about 90 % of the device's "
                         "rate)."], rows=sd_rows, columns=[dict(data=sd_data)], **common),
         ],
-        label_w=1.9, annot_w=1.55, group_headers=True, row_h=0.28,
+        label_w=2.35, annot_w=1.55, group_headers=True, row_h=0.28,
         caption=[
             "The targets are half of each tool's own probe in the same round and configuration. tickertape: "
             "zero-copy reader; in SD the blocking Writer::checkpoint(). Chronicle Queue: ExcerptAppender.sync with "
