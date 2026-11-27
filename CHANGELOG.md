@@ -5,6 +5,12 @@ All notable changes to `tickertape` and `tickertape-cli` are listed here. The fo
 
 ## [Unreleased]
 
+- Docs: charts of the performance results beside their tables, in light and dark variants: in the README the comparison
+  at v1.0.0 (W1 and W3 throughput, W2 reader p99.9, the ten-minute probe and paced runs), and in
+  `docs/benchmarks.md` the same plus before and after charts with their costs for ADR 0058, ADR 0059 and the seek
+  index. Each run is a point where the tables give a range. The values are in `docs/charts/data/`, checked against the
+  tables by `docs/charts/check_tables.py`; `docs/charts/make.py` draws the SVGs. The README's Performance section has a
+  new "Since 1.0.0" paragraph; no published number or sentence changed.
 - Fixed: a spare segment that came to nothing (its preparation failed after its blocks were allocated) gives its
   blocks back even while another descriptor of its file is open, such as the copy a child process forked at that moment
   holds until it executes its new program. It is truncated before its name is removed, if it has no other name; so are

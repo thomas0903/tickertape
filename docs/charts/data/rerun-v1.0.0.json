@@ -1,0 +1,1994 @@
+{
+ "about": "Values plotted by the comparison charts: the README tables of the rerun at v1.0.0 (ext4, pinned).",
+ "source": "raw result files of the rerun (not in the repository), exported by docs/charts/export_rerun.py",
+ "section": "docs/benchmarks.md#2026-11-25-to-2026-11-26-comparison-rerun-at-v100-google-cloud-vms-linux-x86-64-and-aarch64",
+ "session_commit": {
+  "x86-64": "fb2d91b0d0531ba4628779479c7c5e5b04edda62",
+  "aarch64": "fb2d91b0d0531ba4628779479c7c5e5b04edda62"
+ },
+ "library": "v1.0.0",
+ "filesystem": "ext4",
+ "config": "pinned",
+ "machines": {
+  "x86-64": "Google Cloud c4-standard-16-lssd (Xeon 6985P-C)",
+  "aarch64": "Google Cloud c4a-standard-8-lssd (Neoverse-V2)"
+ },
+ "cells": [
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    5.494486143046057,
+    5.525063039588017,
+    5.496031549199664,
+    5.522039719545764
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    10.464623638659727,
+    10.556851872451396,
+    10.535287196459148,
+    10.527596720952603
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    2.82930099940248,
+    2.816101635586198,
+    2.7560463522899714,
+    2.8174861757223297
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    4.017613700576973,
+    4.186263262709956,
+    4.135247401513914,
+    4.196525646059319
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    8.508980096797817,
+    8.530156093582262,
+    8.502711238275772,
+    8.47028858239319
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    30.840454188602454,
+    19.107685969231927,
+    29.11637141064656,
+    20.074041899102326
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    2.8688084157527642,
+    2.852153788246348,
+    2.835674049930095,
+    2.8243425566005307
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-cold",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    3.082006016075743,
+    2.879362071574319,
+    2.6259343632475485,
+    2.611603684231103
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    5.599239829283208,
+    5.590783579850736,
+    5.6014708431763545,
+    5.569634601671319
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    10.537737476739393,
+    10.548705027257537,
+    10.528878851076948,
+    10.205808080473041
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    3.074598302194519,
+    3.0149094508125365,
+    2.9689223598598136,
+    2.9871696582424003
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    3.817548223173717,
+    3.7743309413385178,
+    3.8349104786167696,
+    4.01758658351066
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    8.686162126364843,
+    8.651005388270056,
+    8.537617605469075,
+    8.58138300022707
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    24.925362870287138,
+    19.436379588683835,
+    19.772391303849215,
+    19.993414569109227
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    2.928109866430169,
+    3.0413821402984715,
+    3.0039087762168766,
+    3.005456375996057
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W1-steady",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    3.055459181280546,
+    3.04829824330535,
+    2.9170845268706223,
+    2.962664589720282
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    28.322204500704178,
+    28.16683928714124,
+    29.102979525209918,
+    29.29588740817058
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "million records/s",
+   "runs": [
+    28.142461077920988,
+    28.480934876434183,
+    28.12309659366867,
+    28.21557057075359
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "million records/s",
+   "runs": [
+    27.221711558036567,
+    31.59334661812496,
+    31.001397853029196,
+    31.569854917890442
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "yaque",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    20.21887539177862,
+    21.339017820064406,
+    22.042708850533348,
+    20.698365758461705
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    17.12296514962903,
+    17.005012567554537,
+    15.313680062614575,
+    16.257936718257433
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "million records/s",
+   "runs": [
+    6.4320975044233535,
+    6.263271873099097,
+    6.532562308069236,
+    6.524580443379169
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "million records/s",
+   "runs": [
+    10.363389130856755,
+    10.16348266775565,
+    10.048243627303409,
+    10.1716196351318
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "yaque",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    3.9404422642064962,
+    4.411435145727348,
+    4.075313754330632,
+    4.1582707714565315
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    35.56811853118182,
+    35.94901868345994,
+    36.77042151993332,
+    35.71820706316115
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "million records/s",
+   "runs": [
+    32.77458349403804,
+    31.012998664208123,
+    32.35655997220442,
+    32.59009025304054
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "million records/s",
+   "runs": [
+    23.464257319182323,
+    20.8505098095602,
+    25.498866192914733,
+    26.412298622730688
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "yaque",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    29.60897177900799,
+    28.892744786195856,
+    29.038899260777068,
+    29.33933623976622
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    10.27704867826877,
+    10.58544609133991,
+    10.478910302309227,
+    10.459008218270299
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "million records/s",
+   "runs": [
+    6.484406849582705,
+    6.396082527373634,
+    6.538093745541837,
+    6.566672011937684
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "million records/s",
+   "runs": [
+    9.455180223771968,
+    9.11263527023611,
+    9.35877597692051,
+    9.473323925059566
+   ],
+   "n": 4
+  },
+  {
+   "chart": "throughput",
+   "workload": "W3",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "yaque",
+   "reader": null,
+   "unit": "million records/s",
+   "runs": [
+    7.392909091245133,
+    7.401037033309107,
+    7.383054811282106,
+    7.437885105798709
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    5.943,
+    7.339,
+    5.567,
+    5.563
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    0.739,
+    0.729,
+    0.781,
+    0.737
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    9.151,
+    9.039,
+    9.303,
+    9.407
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    6.059,
+    6.115,
+    6.003,
+    6.447
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    3.073,
+    3.387,
+    2.873,
+    3.457
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    3.025,
+    0.619,
+    2.343,
+    1.983
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    13.271,
+    7.847,
+    10.767,
+    8.439
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    7.943,
+    8.035,
+    8.319,
+    8.407
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    5.595,
+    6.071,
+    4.951,
+    5.051
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    2.077,
+    1.988,
+    1.88,
+    1.999
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    4.647,
+    4.571,
+    5.119,
+    5.959
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    2.771,
+    2.853,
+    3.461,
+    2.807
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    8.791,
+    8.663,
+    8.391,
+    8.551
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    11.711,
+    11.647,
+    11.919,
+    12.407
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    8.863,
+    8.807,
+    8.727,
+    9.095
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    0.825,
+    1.761,
+    2.707,
+    0.821
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    15.415,
+    14.511,
+    16.255,
+    15.159
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    14.655,
+    14.455,
+    14.375,
+    14.359
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    24.255,
+    25.535,
+    26.815,
+    31.071
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "aarch64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    24.783,
+    26.175,
+    27.087,
+    28.495
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    2.621,
+    3.707,
+    2.563,
+    5.651
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    1.834,
+    1.762,
+    1.816,
+    1.676
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    5.623,
+    6.051,
+    6.075,
+    5.799
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    4.419,
+    4.491,
+    4.295,
+    4.359
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    2.191,
+    2.353,
+    2.189,
+    2.165
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    0.423,
+    0.389,
+    1.658,
+    3.465
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    11.783,
+    12.223,
+    15.159,
+    15.327
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    5.103,
+    5.399,
+    5.359,
+    7.075
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    4.171,
+    7.799,
+    8.351,
+    3.829
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 64,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    5.959,
+    2.465,
+    2.273,
+    2.271
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    3.259,
+    3.371,
+    3.499,
+    3.637
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    2.359,
+    2.501,
+    15753.215,
+    2.821
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    6.019,
+    5.983,
+    5.943,
+    5.887
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    7.643,
+    7.427,
+    7.023,
+    6.943
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 10000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    6.391,
+    6.691,
+    4.595,
+    6.835
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    0.765,
+    0.772,
+    5.579,
+    1.276
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    23.935,
+    24.287,
+    24.607,
+    24.335
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "plain file",
+   "reader": null,
+   "unit": "µs",
+   "runs": [
+    10.719,
+    11.255,
+    9.847,
+    10.655
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "safe",
+   "unit": "µs",
+   "runs": [
+    29.023,
+    30.223,
+    29.247,
+    29.679
+   ],
+   "n": 4
+  },
+  {
+   "chart": "w2",
+   "workload": "W2",
+   "metric": "reader p99.9",
+   "machine": "x86-64",
+   "payload": 1024,
+   "rate": 100000,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "unit": "µs",
+   "runs": [
+    29.023,
+    29.839,
+    28.559,
+    28.991
+   ],
+   "n": 4
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1285285,
+     "sync_p50_us": 302776.319,
+     "sync_max_us": 325844.991,
+     "reader_p99_9_us": 302776.319
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1287628,
+     "sync_p50_us": 303824.895,
+     "sync_max_us": 540016.639,
+     "reader_p99_9_us": 381681.663
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "Writer::checkpoint (blocking)",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1729024,
+     "sync_p50_us": 1379.327,
+     "sync_max_us": 2355.199,
+     "reader_p99_9_us": 988.671
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1733310,
+     "sync_p50_us": 1485.823,
+     "sync_max_us": 41943.039,
+     "reader_p99_9_us": 1798.143
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 171867,
+     "sync_p50_us": 506986.495,
+     "sync_max_us": 845152.255,
+     "reader_p99_9_us": 621281.279
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 170648,
+     "sync_p50_us": 502792.191,
+     "sync_max_us": 514326.527,
+     "reader_p99_9_us": 502267.903
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "Writer::checkpoint (blocking)",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 169089,
+     "sync_p50_us": 1393.663,
+     "sync_max_us": 2385.919,
+     "reader_p99_9_us": 836.607
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 168712,
+     "sync_p50_us": 1402.879,
+     "sync_max_us": 76546.047,
+     "reader_p99_9_us": 1595.391
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1530662,
+     "sync_p50_us": 361496.575,
+     "sync_max_us": 404488.191,
+     "reader_p99_9_us": 369623.039
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1476421,
+     "sync_p50_us": 348651.519,
+     "sync_max_us": 413663.231,
+     "reader_p99_9_us": 352059.391
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "Writer::checkpoint (blocking)",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1771815,
+     "sync_p50_us": 2953.215,
+     "sync_max_us": 4214.783,
+     "reader_p99_9_us": 2390.015
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1764927,
+     "sync_p50_us": 2338.815,
+     "sync_max_us": 3801.087,
+     "reader_p99_9_us": 1826.815
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "synchronous store flush (ExcerptAppender.sync, SyncMode.SYNC)",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 175186,
+     "sync_p50_us": 516161.535,
+     "sync_max_us": 592969.727,
+     "reader_p99_9_us": 515637.247
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 174615,
+     "sync_p50_us": 514326.527,
+     "sync_max_us": 527958.015,
+     "reader_p99_9_us": 513802.239
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SD",
+   "unit": "µs",
+   "sync_operation": "Writer::checkpoint (blocking)",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 173190,
+     "sync_p50_us": 2990.079,
+     "sync_max_us": 4114.431,
+     "reader_p99_9_us": 2107.391
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 172766,
+     "sync_p50_us": 2287.615,
+     "sync_max_us": 3809.279,
+     "reader_p99_9_us": 1548.287
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1623026,
+     "reader_p99_9_us": 26017.791,
+     "reader_max_us": 167641.087
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1910474,
+     "reader_p99_9_us": 14721.023,
+     "reader_max_us": 78774.271
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1285285,
+     "reader_p99_9_us": 91815.935,
+     "reader_max_us": 134086.655
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1287628,
+     "reader_p99_9_us": 89980.927,
+     "reader_max_us": 133365.759
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1729024,
+     "reader_p99_9_us": 501.247,
+     "reader_max_us": 1474.559
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1733310,
+     "reader_p99_9_us": 697.343,
+     "reader_max_us": 23805.951
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1388341,
+     "reader_p99_9_us": 84279.295,
+     "reader_max_us": 166199.295
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1398435,
+     "reader_p99_9_us": 80609.279,
+     "reader_max_us": 159645.695
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 171867,
+     "reader_p99_9_us": 91422.719,
+     "reader_max_us": 162922.495
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 170648,
+     "reader_p99_9_us": 99483.647,
+     "reader_max_us": 135528.447
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 169089,
+     "reader_p99_9_us": 322.559,
+     "reader_max_us": 1136.639
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 168712,
+     "reader_p99_9_us": 401.151,
+     "reader_max_us": 7831.551
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 3603440,
+     "reader_p99_9_us": 36241.407,
+     "reader_max_us": 78381.055
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 3244623,
+     "reader_p99_9_us": 34963.455,
+     "reader_max_us": 80412.671
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1530662,
+     "reader_p99_9_us": 102694.911,
+     "reader_max_us": 135528.447
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1476421,
+     "reader_p99_9_us": 100007.935,
+     "reader_max_us": 136052.735
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 1771815,
+     "reader_p99_9_us": 642.047,
+     "reader_max_us": 1692.671
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 1764927,
+     "reader_p99_9_us": 654.335,
+     "reader_max_us": 1558.527
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 2087513,
+     "reader_p99_9_us": 107413.503,
+     "reader_max_us": 125960.191
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 2018317,
+     "reader_p99_9_us": 99155.967,
+     "reader_max_us": 119144.447
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 175186,
+     "reader_p99_9_us": 100270.079,
+     "reader_max_us": 135397.375
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 174615,
+     "reader_p99_9_us": 98435.071,
+     "reader_max_us": 139591.679
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "SV",
+   "unit": "µs",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "target_records_per_s": 173190,
+     "reader_p99_9_us": 503.551,
+     "reader_max_us": 1403.903
+    },
+    {
+     "round": 2,
+     "target_records_per_s": 172766,
+     "reader_p99_9_us": 508.415,
+     "reader_max_us": 1375.231
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 3246052.4952431824
+    },
+    {
+     "round": 2,
+     "records_per_s": 3820949.870317162
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 2570571.9583759042
+    },
+    {
+     "round": 2,
+     "records_per_s": 2575257.5732785645
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 3458048.3669898035
+    },
+    {
+     "round": 2,
+     "records_per_s": 3466621.56721968
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 2776683.896326385
+    },
+    {
+     "round": 2,
+     "records_per_s": 2796871.5955735515
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 343735.72792023607
+    },
+    {
+     "round": 2,
+     "records_per_s": 341296.7376877397
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "aarch64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 338178.7855159456
+    },
+    {
+     "round": 2,
+     "records_per_s": 337424.3998221798
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 7206880.151997385
+    },
+    {
+     "round": 2,
+     "records_per_s": 6489247.38986782
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 3061325.1488622073
+    },
+    {
+     "round": 2,
+     "records_per_s": 2952843.274896352
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 64,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 3543631.5971200126
+    },
+    {
+     "round": 2,
+     "records_per_s": 3529855.979625991
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Aeron IPC",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 4175026.806719909
+    },
+    {
+     "round": 2,
+     "records_per_s": 4036634.976280873
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "Chronicle Queue",
+   "reader": null,
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 350373.6655415379
+    },
+    {
+     "round": 2,
+     "records_per_s": 349230.78081248736
+    }
+   ],
+   "n": 2
+  },
+  {
+   "workload": "probe",
+   "unit": "records/s",
+   "chart": "ten-minute",
+   "machine": "x86-64",
+   "payload": 1024,
+   "tool": "tickertape",
+   "reader": "zero-copy",
+   "runs": [
+    {
+     "round": 1,
+     "records_per_s": 346381.9758601271
+    },
+    {
+     "round": 2,
+     "records_per_s": 345533.5309826603
+    }
+   ],
+   "n": 2
+  }
+ ]
+}
