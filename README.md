@@ -94,6 +94,12 @@ and a 64 B burst lasts 32–52 ms; on x86-64 the first repeat of every W1-cold r
 (21.99 in the unpinned one) and the second at 17.53–20.07 (cause not traced), which makes tickertape's range
 19.11–30.84. W3 replays the records from a warm page cache in a new process.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/rerun-throughput-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/charts/rerun-throughput-light.svg">
+  <img alt="W1 append and W3 warm replay throughput at v1.0.0, ext4, pinned (the README's comparison cells), million records/s from zero, each of 4 runs a point. W1: tickertape ahead of Chronicle Queue at 64 B on both machines and at 1,024 B on aarch64; their ranges overlap at 1,024 B on x86-64. W3: Chronicle Queue ahead of both tickertape readers on x86-64 and at 1,024 B on aarch64, overlapping at 64 B on aarch64; yaque ahead of a tickertape reader in two x86-64 cells." src="docs/charts/rerun-throughput-light.svg">
+</picture>
+
 | | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
 |---|---|---|---|---|
 | W1 cold: tickertape | 19.11–30.84 | 2.61–3.08 | 10.46–10.56 | 4.02–4.20 |
@@ -110,6 +116,12 @@ yaque, queue-file and the plain file appended more slowly than both journals in 
 **Reader latency, p99.9 in µs**, lower is better: the time from each record's scheduled send to the reader's validated
 read, over 1,000,000 records measured after 100,000 unmeasured ones. A send that starts late (more than 1 µs after its
 scheduled time) still runs, and its delay counts in the latency.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/rerun-w2-p999-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/charts/rerun-w2-p999-light.svg">
+  <img alt="Reader p99.9 at v1.0.0, ext4, pinned (the README's comparison cells), logarithmic axis from 0.2 to 100 µs, each of 4 runs a point. At 10,000 records/s Chronicle Queue is the lowest in three cells and in three of four runs in the fourth, whose fourth run, 15.75 ms, is marked beyond the axis; Aeron IPC is below tickertape's zero-copy reader at 1,024 B. At 100,000 records/s Aeron IPC has the lowest observed p99.9 in all four cells; tickertape's zero-copy reader is below Chronicle Queue at 64 B; Chronicle Queue and the plain file are below both tickertape readers at 1,024 B." src="docs/charts/rerun-w2-p999-light.svg">
+</picture>
 
 | | tickertape, zero-copy | tickertape, safe | Chronicle Queue | Aeron IPC | plain file |
 |---|---|---|---|---|---|
@@ -132,6 +144,12 @@ in which every tool answers the same question, and at 1,024 B it measures the di
 the writer's thread) are paced at **half of each tool's own probe in the same round**, so each tool runs at its own
 target rate, printed in the table: read them as "at half of its own maximum", not as the same load. tickertape ran its
 zero-copy reader and, in SD, the blocking `Writer::checkpoint()`. Aeron IPC has no sync, so no SD row.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/charts/rerun-probe-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/charts/rerun-probe-light.svg">
+  <img alt="Ten-minute unpaced probe at v1.0.0, ext4, pinned (the README's comparison cells), million records/s from zero, one point per round. Aeron IPC, not a durable journal, is the highest except in one aarch64 round at 64 B. At 64 B tickertape is above Chronicle Queue on both machines; at 1,024 B both journals are at about the SSD's limit and Chronicle Queue is 1.1–1.6 % above tickertape in every round." src="docs/charts/rerun-probe-light.svg">
+</picture>
 
 | | x86-64, 64 B | x86-64, 1,024 B | aarch64, 64 B | aarch64, 1,024 B |
 |---|---|---|---|---|
@@ -276,6 +294,51 @@ write-back off (`WriterConfig::early_writeback(false)`) brought them to 1.0–2.
 background checkpoint becoming durable 0.93 s (median) after its request instead of 0.05–0.39 s. On x86-64 there were no
 such stalls either way (longest appends 0.25–0.64 ms), and turning it off only made checkpoints that late (0.93 s
 against 1.7–2.3 ms). What to plan for is in [`docs/operations.md`](docs/operations.md).
+
+### Since 1.0.0
+
+These changes were merged after v1.0.0 and are not in the 1.0.0 crate; `CHANGELOG.md` says which release has them. Each
+was measured on Google Cloud VMs against its own baseline, in other cells than the comparison; the comparison above ran
+at v1.0.0 and was not rerun, so none of these figures changes a row of it. ADR 0058, ADR 0059 and the seek index have
+before-and-after charts in `docs/benchmarks.md`; ADR 0053 has tables only.
+
+- **Early write-back stops at the folio boundary** ([ADR
+  0058](docs/benchmarks.md#2026-11-26-early-write-back-to-the-folio-boundary-adr-0058-change-1-google-cloud-vms)).
+  Baseline: the commit before the change. 10-minute runs (611 s with the warm-up), n = 2 per build, a background
+  checkpoint every second. Gain, where the writer fills 128 KiB folios (kernel 7.0, ext4 and xfs): at 1,024 B on
+  aarch64, at 90 % of the unpaced rate of the earlier sustained session (304,571 records/s), the seconds with an append
+  of 50 ms or more went from 138–151 to 0 of 611 on ext4 and from 2–4 to 0 on xfs, and background checkpoints became
+  durable after 1.03–1.12 ms on ext4 and 932–938 µs on xfs instead of 352–361 ms and 382–406 ms (median); in the four
+  paced cells run on kernel 7.0 the device wrote 1.002–1.005 times the appended bytes instead of 1.059–1.084. Measured
+  cost: in that aarch64 ext4 cell the roll's median append rose from 188–189 µs to 260–266 µs; at 64 B on aarch64 (half
+  of the unpaced rate) a background checkpoint became durable after 946–952 µs instead of 912–914 µs (median) and the
+  zero-copy reader's p99.9 was 325–335 µs instead of 312–316 µs; at 1,024 B on x86-64 (half of the unpaced rate) the
+  checkpoint's time to durable had a p99 of 5.06–5.98 ms instead of 4.08–4.87 ms. On kernel 6.8, whose ext4 has no large
+  folios, there was no gain (device bytes 1.003 → 1.002–1.003), and at 1,024 B the roll's median append rose (148–151 µs
+  → 158–366 µs and 152–180 µs → 173–271 µs on two VMs). The change missed the first gate set for a default and was made
+  the default anyway (ADR 0058, "Decision for change 1").
+- **Finished segments released off the writer's thread, Linux** ([ADR
+  0059](docs/benchmarks.md#2026-11-26-finished-segments-released-off-the-writers-thread-adr-0059-issue-60-google-cloud-vms-and-macos)).
+  Baseline: `main` with ADR 0058's change. x86-64, 60-second runs at half of the unpaced rate, 6 strictly alternating
+  pairs per cell. Gain: without checkpoints the roll's median append went from 0.88–1.06 ms to 47–176 µs; with a
+  checkpoint every second it was 161–171 µs before and after. Measured cost: at 64 B without the spare segment all
+  appends' p99.99 was higher in all 6 pairs, 6.0–6.6 µs → 6.6–7.0 µs.
+- **Durable-only readers wake on checkpoints only** ([ADR
+  0053](docs/benchmarks.md#2026-11-26-durable-only-readers-wake-on-checkpoints-only-adr-0053-issue-82-google-cloud-vms)).
+  Baseline: v1.0.0. 15-second runs (after a 3 s warm-up) at 1,024 B, at 173,119 or 169,206 and at 100,000 records/s, 10
+  rounds on one x86-64 and one aarch64 VM. Gain: a blocking durable-only reader used 2–4 % of a core (medians of the
+  rounds) instead of 95–99 %. Measured cost, from five rounds of an instrumented build on the same two VMs with the
+  writer's helper threads free to run on the reader's CPU: the reader returned the first record a checkpoint covers
+  14.7–145 µs after the checkpoint completed (median of the runs' medians; 1,200–1,455 µs in the worst checkpoint),
+  where the 1.0.0 reader, which polls the marker on a full core, returned it 10.4–111 µs before that point.
+- **Seek index** ([seeks](docs/benchmarks.md#2026-11-26-seeks-with-and-without-the-seek-index-google-cloud-vms)), added
+  after 1.0.0 and off by default. Baseline: the same build without the option. x86-64 and aarch64 4-vCPU VMs, both
+  readers, 64 B and 1,024 B, the first seek of a new process, 16 cold runs per cell. Gain: at the three targets measured
+  (1/64 of the way in, the middle, the last record) of a sealed, indexed 128 MiB segment, the cold median was 0.46–0.81
+  ms with the index, against 1.25–1.96 ms at 1/64 in and 191–192 ms to the last record without it. Measured cost: index
+  files of 49,256 bytes per segment; building them for 1 GiB took 1.57 s cold (median); the records before the place a
+  seek lands on are not read, so damage there goes unnoticed; the newest segment is never indexed (92.8–93.3 ms cold to
+  its last record either way), and there the safe reader was 0.07–0.08 ms slower with the option (cold, 1/64 in).
 
 ## Quickstart
 

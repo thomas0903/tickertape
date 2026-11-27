@@ -303,6 +303,12 @@ describes what is released.
 
 ### Documentation
 
+- Docs: charts of the performance results beside their tables, in light and dark variants: in the README the comparison
+  at v1.0.0 (W1 and W3 throughput, W2 reader p99.9, the ten-minute probe; ext4, pinned), and in `docs/benchmarks.md`
+  the same plus the ten-minute paced runs (SV on ext4 and xfs, SD on ext4) and before and after charts with their costs
+  for ADR 0058, ADR 0059 and the seek index. Each run is a point where the tables give a range. The values are in
+  `docs/charts/data/`, checked against the tables by `docs/charts/check_tables.py`; `docs/charts/make.py` draws the
+  SVGs. The README's Performance section has a new "Since 1.0.0" list; no published number or sentence changed.
 - Docs: `docs/operations.md` → "How many segments to keep" (issue #80): what grows with the number of segments (each
   seek's listing, a checkpoint with retention, removals, a writer's open, `max_bytes` planning, `list_segments`), with
   the figures of `docs/benchmarks.md` (2026-11-25, one x86-64 cloud machine), what a run still reads per file, and what
