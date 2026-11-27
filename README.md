@@ -4,7 +4,7 @@
 records events, other processes on the same machine follow them live, and everything can be replayed later or
 exported to Parquet for DuckDB and Python.
 
-> Status: [v1.0.0](https://crates.io/crates/tickertape/1.0.0), stable. Linux and macOS. The on-disk format is version 1. What 1.x keeps compatible: [`docs/compatibility.md`](docs/compatibility.md).
+> Status: [v1.1.0](https://crates.io/crates/tickertape/1.1.0), stable. Linux and macOS. The on-disk format is version 1. What 1.x keeps compatible: [`docs/compatibility.md`](docs/compatibility.md).
 
 Think of it as a flight recorder for a trading system or any other latency-sensitive program:
 
@@ -348,7 +348,7 @@ Add the library to your project:
 cargo add tickertape
 ```
 
-[API documentation](https://docs.rs/tickertape/1.0.0/tickertape/) · [CLI reference](docs/cli.md)
+[API documentation](https://docs.rs/tickertape/1.1.0/tickertape/) · [CLI reference](docs/cli.md)
 
 Install the `tickertape` CLI (Linux x86-64 and ARM64, macOS Intel and Apple Silicon) in one of these ways.
 [Installation](docs/install.md) has the details, the static Linux builds and how to verify a download.

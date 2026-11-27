@@ -1,6 +1,7 @@
 # 0059: Release finished segments off the writer's thread
 
-- **Status:** proposed
+- **Status:** accepted (2026-11-27, by the orchestrator: measured and reviewed in PR #114, and the Linux default from
+  1.1)
 - **Date:** 2026-11-27
 
 ## Context

@@ -43,13 +43,13 @@ The binding needs `libtickertape`, built from source with Cargo (Rust 1.85 or ne
 
 ```bash
 cargo build --release -p tickertape-ffi                    # target/release/libtickertape.{so,dylib}
-mvn -f bindings/java/pom.xml package -DskipTests           # bindings/java/target/tickertape-1.0.0.jar
+mvn -f bindings/java/pom.xml package -DskipTests           # bindings/java/target/tickertape-1.1.0.jar
 ```
 
 Run with the JAR on the class path, native access enabled, and the library's location:
 
 ```bash
-java --enable-native-access=ALL-UNNAMED -cp bindings/java/target/tickertape-1.0.0.jar:app.jar \
+java --enable-native-access=ALL-UNNAMED -cp bindings/java/target/tickertape-1.1.0.jar:app.jar \
      -Dtickertape.library.path=target/release/libtickertape.so com.example.App
 ```
 
@@ -510,7 +510,7 @@ reports ages from the command line.
 
 ## Versioning
 
-The binding's version is the version of the C library it is written for (1.0.0 here), and it is released with the
+The binding's version is the version of the C library it is written for (1.1.0 here), and it is released with the
 library. At load it checks the library with the C ABI's rule (ADR 0028):
 
 - **Before 1.0** (releases 0.x) the C ABI was unstable (ABI version 0), so the library had to be exactly the

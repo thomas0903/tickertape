@@ -11,7 +11,7 @@ body:
     attributes:
       label: Version and installation
       description: Crate version or git commit; for the CLI, include `tickertape --version` and how you installed it.
-      placeholder: tickertape 1.0.0, prebuilt Linux x86-64 archive
+      placeholder: tickertape 1.1.0, prebuilt Linux x86-64 archive
     validations:
       required: true
   - type: textarea

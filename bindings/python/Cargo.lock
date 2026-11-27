@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "crc32c",
  "libc",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "tickertape-python"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "pyo3",
  "tickertape",
